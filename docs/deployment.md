@@ -4,7 +4,9 @@
 
 一个 Rust 可执行文件、一份 SQLite 数据库、已有的 HTTPS 反向代理。前端已嵌入可执行文件，不需要安装 Node.js。默认只绑定 `127.0.0.1:3080`，公网仅经域名的 HTTPS 入口访问。
 
-仓库提供 systemd、Nginx 和 Caddy 示例。只选择与服务器现有环境一致的反向代理。当前尚未连接或修改阿里云服务器；真实域名、证书位置、系统版本和端口占用需要部署时确认。
+仓库提供 systemd、Nginx 和 Caddy 示例。只选择与服务器现有环境一致的反向代理。当前尚未连接或修改阿里云服务器；真实域名、证书位置和端口占用需要部署时确认。
+
+已确认的目标服务器：Ubuntu 22.04.5 LTS、x86_64、Nginx 1.18.0（Ubuntu）、Certbot 1.21.0。实际域名尚未确定，文中的示例域名必须替换。
 
 ## 1. 构建
 
@@ -17,12 +19,25 @@ cargo build --release --locked -j 1
 
 产物位于 `target/release/tally`。**构建环境必须匹配服务器的 CPU 架构与 libc 兼容性**。本项目目前在 Arch Linux / WSL 的 x86_64 环境验证；该环境生成的 GNU/Linux 二进制不能直接假定兼容旧版 Ubuntu、Alibaba Cloud Linux 等系统。实际部署应在匹配服务器的发行版容器或 CI 环境构建，或另外构建并验证 musl 目标。
 
+针对上述 Ubuntu x86_64 服务器，使用静态 musl 版本可避免依赖开发机的 glibc。以下命令在开发机执行，需要已安装 `musl-gcc`：
+
+```sh
+rustup target add x86_64-unknown-linux-musl
+CC_x86_64_unknown_linux_musl=musl-gcc \
+  cargo build --release --locked --target x86_64-unknown-linux-musl -j 1
+TALLY_TEST_BINARY=target/x86_64-unknown-linux-musl/release/tally python3 scripts/smoke.py
+```
+
+产物为 `target/x86_64-unknown-linux-musl/release/tally`。发布包只需包含该文件、`deploy/`、本部署说明和校验和；不要上传本地演示数据库或账户文件。在服务器解压后先运行 `sha256sum -c SHA256SUMS` 和 `./tally --help`，再安装。
+
+当前 musl 产物已在开发机完成 40 项真实 HTTP 检查（含 XLSX 和数据库备份），并确认是没有动态加载器或共享库依赖的 static PIE。尚未在目标服务器执行；上传后仍需完成启动和 HTTPS 验收。
+
 ## 2. 初始化目录和账户
 
 以下命令在目标服务器执行；先确认没有同名服务账户、目录和 3080 端口冲突：
 
 ```sh
-sudo useradd --system --home-dir /var/lib/tally --shell /usr/sbin/nologin tally
+sudo useradd --system --user-group --home-dir /var/lib/tally --shell /usr/sbin/nologin tally
 sudo install -d -m 0755 /opt/tally
 sudo install -d -o tally -g tally -m 0700 /var/lib/tally
 sudo install -m 0755 ./tally /opt/tally/tally
@@ -50,6 +65,37 @@ curl --fail http://127.0.0.1:3080/health
 将账本子域名解析到服务器，接入现有的 Nginx 或 Caddy。示例文件见 `deploy/`。线上启动命令为 `tally serve`，不要加 `--dev`：生产会话 Cookie 需要 HTTPS。
 
 Nginx 示例要求已有正确的证书；替换占位域名和证书路径后，先执行 `nginx -t`，通过后再 reload。Caddy 示例也应先按现有部署方式校验配置后 reload。不要覆盖服务器上其他服务的虚拟主机配置。
+
+### 已有 Nginx，使用 Certbot 首次申请证书
+
+以下流程适用于 Nginx 直接运行在宿主机、服务由 systemd 管理，且已经安装 Certbot 的 Nginx 插件。若 Nginx 由 Docker、宝塔或 1Panel 管理，先确认它实际使用的配置目录和网络；容器中的 `127.0.0.1` 不一定能访问宿主机的一笔服务。
+
+1. 使用独立子域名，例如 `yibi.example.com`，把 DNS 的 A 记录指向服务器公网 IPv4。示例只监听 IPv4；若域名还有 AAAA 记录，须同时正确配置 IPv6 地址、监听和防火墙。当前应用使用根路径 `/`，不支持直接挂在已有网站的 `/yibi/` 子路径。
+2. 确认阿里云安全组和主机防火墙允许公网访问 80、443；一笔仍只监听 `127.0.0.1:3080`，不需要开放公网 3080。第 3 节的健康检查应已通过。
+3. 先备份现有 Nginx 配置，再把 `deploy/nginx-http.conf.example` 作为一个新站点加载，并替换其中的域名。它不引用尚未申请的证书。加载位置以现有 Nginx 的 `include` 为准：常见为 `/etc/nginx/conf.d/yibi.conf`，或 `sites-available` 配合 `sites-enabled` 的链接；不要把文件放进未被加载的目录，也不要为同一域名同时启用两份模板。
+4. 校验并平滑重载，然后申请证书：
+
+```sh
+sudo nginx -t && sudo systemctl reload nginx
+sudo certbot --nginx -d yibi.example.com --redirect
+sudo nginx -t
+curl --fail https://yibi.example.com/health
+```
+
+把命令中的 `yibi.example.com` 全部替换为自己的域名。Certbot 会为指定站点配置 HTTPS 和 HTTP 跳转；不要重新复制 HTTP 模板覆盖它生成的配置。Nginx 采用自定义 `-c` 配置启动时，检查命令和 Certbot 也必须指向同一套配置。
+
+生产服务始终使用 `tally serve`。HTTP 阶段只用于连通性检查和证书签发，不要在 HTTP 页面输入账本密码；HTTPS 成功后再登录。模板设置 `client_max_body_size 9m` 以容纳 8MiB 账单和上传封装，并关闭该站点的代理缓存。
+
+检查现有 Certbot 的自动续期任务，不要重复建立多个任务；可以针对这个证书验证续期。证书名以第一条命令的实际输出为准，未必与域名完全相同：
+
+```sh
+sudo certbot certificates
+sudo certbot renew --cert-name yibi.example.com --dry-run
+```
+
+流程依据：[Nginx 反向代理](https://nginx.org/en/docs/http/ngx_http_proxy_module.html#proxy_pass)、[Nginx 配置检查与重载](https://nginx.org/en/docs/switches.html)、[Certbot Nginx 插件](https://eff-certbot.readthedocs.io/en/stable/using.html#nginx)、[Certbot 自动续期](https://eff-certbot.readthedocs.io/en/stable/using.html#automated-renewals)。本地未安装 Nginx/Certbot，模板还需在实际服务器上执行上述配置检查。
+
+### 部署验收
 
 验收清单：
 

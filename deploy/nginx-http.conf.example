@@ -1,0 +1,20 @@
+# First deployment with Certbot: replace the domain and load this server block.
+# After HTTP works, run: sudo certbot --nginx -d yibi.example.com --redirect
+# Use either this template or nginx.conf.example, not both for the same domain.
+server {
+    listen 80;
+    server_name yibi.example.com;
+
+    client_max_body_size 9m;
+
+    location / {
+        proxy_pass http://127.0.0.1:3080;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Connection "";
+        proxy_cache off;
+        proxy_read_timeout 60s;
+    }
+}
