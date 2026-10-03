@@ -1003,6 +1003,7 @@ dependencies = [
  "csv",
  "encoding_rs",
  "http-body-util",
+ "quick-xml",
  "rand",
  "rpassword",
  "rusqlite",

@@ -104,7 +104,8 @@ pub fn router(state: AppState) -> Router {
                 )
             }),
         )
-        .layer(DefaultBodyLimit::max(8 * 1024 * 1024))
+        // Leave room for multipart headers around an 8 MiB bill file.
+        .layer(DefaultBodyLimit::max(9 * 1024 * 1024))
         .layer(middleware::from_fn(security))
         .with_state(state)
 }

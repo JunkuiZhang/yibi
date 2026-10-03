@@ -6,7 +6,7 @@ use calamine::{Reader, Xlsx};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
-    io::Cursor,
+    io::{Cursor, Read},
 };
 
 const MAX_ROWS: usize = 10_000;
@@ -97,12 +97,23 @@ pub fn parse(filename: &str, bytes: &[u8], rules: &[Rule]) -> Result<Preview, St
         // Inspect the ZIP directory before decompression to bound spreadsheet memory use.
         let mut archive = zip::ZipArchive::new(Cursor::new(bytes))
             .map_err(|_| "无法读取 XLSX 文件，请先解压账单下载包")?;
+        if archive.len() > 256 {
+            return Err("工作簿内容过多，请使用原始账单明细文件".into());
+        }
         let mut total = 0u64;
         for i in 0..archive.len() {
             let f = archive.by_index(i).map_err(|_| "表格压缩内容无效")?;
             total = total.checked_add(f.size()).ok_or("表格过大")?;
             if total > MAX_EXPANDED {
                 return Err("解压后的表格超过 32MB，请分批导出账单".into());
+            }
+        }
+        for i in 0..archive.len() {
+            let mut file = archive.by_index(i).map_err(|_| "表格压缩内容无效")?;
+            if file.name().starts_with("xl/worksheets/") && file.name().ends_with(".xml") {
+                let mut xml = Vec::new();
+                file.read_to_end(&mut xml).map_err(|_| "工作表读取失败")?;
+                check_sheet_bounds(&xml)?;
             }
         }
         let mut book: Xlsx<_> = Xlsx::new(Cursor::new(bytes)).map_err(|_| "无法读取 XLSX 文件")?;
@@ -145,6 +156,65 @@ pub fn parse(filename: &str, bytes: &[u8], rules: &[Rule]) -> Result<Preview, St
         return Err("支持 CSV 和 XLSX；ZIP 下载包请先在本地解压".into());
     };
     parse_table(table, rules)
+}
+
+fn check_sheet_bounds(bytes: &[u8]) -> Result<(), String> {
+    use quick_xml::events::Event;
+    let mut xml = quick_xml::Reader::from_reader(bytes);
+    let mut rows = 0;
+    let mut cells = 0;
+    loop {
+        match xml.read_event().map_err(|_| "工作表 XML 无效")? {
+            Event::Eof => return Ok(()),
+            Event::Start(element) | Event::Empty(element) => {
+                let name = element.local_name();
+                if name.as_ref() == b"row" {
+                    rows += 1;
+                    cells = 0;
+                }
+                if name.as_ref() == b"c" {
+                    cells += 1;
+                }
+                if rows > MAX_ROWS + 100 || cells > 50 {
+                    return Err("工作表范围过大，请分批导出账单".into());
+                }
+                for attribute in element.attributes() {
+                    let attribute = attribute.map_err(|_| "工作表属性无效")?;
+                    let key = attribute.key.as_ref();
+                    if (name.as_ref() == b"c" && key == b"r")
+                        || (name.as_ref() == b"dimension" && key == b"ref")
+                    {
+                        let reference =
+                            std::str::from_utf8(&attribute.value).map_err(|_| "单元格地址无效")?;
+                        for cell in reference.split(':') {
+                            let letters = cell.bytes().take_while(u8::is_ascii_alphabetic).count();
+                            if letters == 0 || letters > 2 {
+                                return Err("工作表范围过大或地址无效".into());
+                            }
+                            let col = cell[..letters].bytes().fold(0usize, |n, b| {
+                                n * 26 + (b.to_ascii_uppercase() - b'A' + 1) as usize
+                            });
+                            let row: usize =
+                                cell[letters..].parse().map_err(|_| "单元格行号无效")?;
+                            if col > 50 || row == 0 || row > MAX_ROWS + 100 {
+                                return Err("工作表范围过大，请分批导出账单".into());
+                            }
+                        }
+                    }
+                    if name.as_ref() == b"row" && key == b"r" {
+                        let row: usize = std::str::from_utf8(&attribute.value)
+                            .map_err(|_| "行号无效")?
+                            .parse()
+                            .map_err(|_| "行号无效")?;
+                        if row > MAX_ROWS + 100 {
+                            return Err("工作表范围过大，请分批导出账单".into());
+                        }
+                    }
+                }
+            }
+            _ => (),
+        }
+    }
 }
 
 fn parse_table(table: Vec<Vec<String>>, rules: &[Rule]) -> Result<Preview, String> {
@@ -317,6 +387,28 @@ fn clean(s: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn oversized_sparse_sheet_rejected_before_range_allocation() {
+        assert!(
+            check_sheet_bounds(br#"<worksheet><dimension ref="A1:XFD1048576"/></worksheet>"#)
+                .is_err()
+        );
+        assert!(
+            check_sheet_bounds(
+                br#"<worksheet><row r="999999999"><c r="A999999999"/></row></worksheet>"#
+            )
+            .is_err()
+        );
+        assert!(
+            check_sheet_bounds(
+                br#"<worksheet><row r="1"><c r="A1"/><c r="J1"/></row></worksheet>"#
+            )
+            .is_ok()
+        );
+        assert!(parse_money("1,,2.00").is_err());
+        assert!(parse_money("1,23.00").is_err());
+        assert!(parse_money("1234.5,0").is_err());
+    }
     #[test]
     fn wechat_preamble_duplicates_refunds_transfers_and_failures() {
         let csv = "微信支付账单明细\n导出账户,测试\n交易时间,交易类型,交易对方,商品,收/支,金额(元),支付方式,当前状态,交易单号\n2026-07-01 12:00:00,商户消费,咖啡店,拿铁,支出,18.50,零钱,支付成功,wx1\n2026-07-01 12:00:00,商户消费,咖啡店,拿铁,支出,18.50,零钱,支付成功,wx1\n2026-07-02 12:00:00,商户退款,咖啡店,退款,收入,18.50,零钱,退款成功,wx1\n2026-07-03 12:00:00,提现,本人,零钱提现,不计收支,100.00,银行卡,成功,wx2\n2026-07-04 12:00:00,商户消费,店,商品,支出,5.00,零钱,交易关闭,wx3\n";

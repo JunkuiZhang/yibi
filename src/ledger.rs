@@ -139,11 +139,21 @@ pub fn add_months(start: &str, offset: u32) -> Result<String, String> {
 }
 
 pub fn parse_money(value: &str) -> Result<i64, String> {
-    let clean = value
-        .trim()
-        .trim_start_matches(['¥', '￥'])
-        .trim()
-        .replace(',', "");
+    let input = value.trim().trim_start_matches(['¥', '￥']).trim();
+    let whole_part = input.split('.').next().unwrap_or("");
+    if whole_part.contains(',') {
+        let groups: Vec<_> = whole_part.split(',').collect();
+        if !(1..=3).contains(&groups[0].len()) || groups.iter().skip(1).any(|g| g.len() != 3) {
+            return Err("金额的千位分隔符格式无效".into());
+        }
+    }
+    if input
+        .split_once('.')
+        .is_some_and(|(_, fraction)| fraction.contains(','))
+    {
+        return Err("金额的小数部分不能包含分隔符".into());
+    }
+    let clean = input.replace(',', "");
     let parts: Vec<_> = clean.split('.').collect();
     if parts.len() > 2
         || parts[0].is_empty()
