@@ -1,0 +1,30 @@
+# Add as a new virtual host to your EXISTING Nginx configuration.
+# Replace the domain and certificate paths. Do not replace other services' blocks.
+server {
+    listen 443 ssl;
+    server_name ledger.example.com;
+
+    ssl_certificate /etc/letsencrypt/live/ledger.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/ledger.example.com/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    client_max_body_size 9m;
+    gzip on;
+    gzip_types text/css application/javascript application/json;
+
+    location / {
+        proxy_pass http://127.0.0.1:3080;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Connection "";
+        proxy_read_timeout 60s;
+    }
+}
+
+server {
+    listen 80;
+    server_name ledger.example.com;
+    return 301 https://$host$request_uri;
+}

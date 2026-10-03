@@ -1,0 +1,30 @@
+[Unit]
+Description=Tally personal ledger
+After=network.target
+
+[Service]
+Type=simple
+User=tally
+Group=tally
+WorkingDirectory=/var/lib/tally
+StateDirectory=tally
+StateDirectoryMode=0700
+Environment=TALLY_DB=/var/lib/tally/tally.sqlite3
+Environment=TALLY_BIND=127.0.0.1:3080
+ExecStart=/opt/tally/tally serve
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=15
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/tally
+MemoryHigh=192M
+MemoryMax=256M
+TasksMax=32
+
+[Install]
+WantedBy=multi-user.target

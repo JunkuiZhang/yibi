@@ -1,0 +1,5 @@
+# Add to an existing Caddyfile; replace this domain with your own.
+ledger.example.com {
+    encode zstd gzip
+    reverse_proxy 127.0.0.1:3080
+}
