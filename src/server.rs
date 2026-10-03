@@ -265,7 +265,7 @@ async fn bootstrap(State(state): State<AppState>) -> Result<Json<Value>> {
         let mut accounts:Vec<String>=entries.iter().map(|e|e.account.clone()).chain(["微信".into(),"支付宝".into(),"工资卡".into(),"现金".into()]).collect();
         accounts.sort();accounts.dedup();
         let username:String=c.query_row("SELECT username FROM owner WHERE id=1",[],|r|r.get(0)).map_err(|e|e.to_string())?;
-        Ok(Json(json!({"username":username,"ledger_start":db::setting(c,"ledger_start")?,"accounts":accounts,"rules":load_rules(c)?,"last_salary":entries.iter().find(|e|e.kind==Kind::Income && e.category=="工资"),"count":entries.len()})))
+        Ok(Json(json!({"username":username,"ledger_start":db::setting(c,"ledger_start")?,"accounts":accounts,"rules":load_rules(c)?,"last_salary":entries.iter().find(|e|e.kind==Kind::Income && e.amount_cents>0 && e.category=="工资"),"count":entries.len()})))
     }).await.map_err(internal)
 }
 
@@ -276,6 +276,40 @@ struct EntryQuery {
     kind: Option<String>,
     mode: Option<String>,
     page: Option<usize>,
+    group_bikes: Option<bool>,
+}
+
+fn display_entry_rows(
+    rows: &[&Entry],
+    views: &HashMap<i64, Value>,
+    group_bikes: bool,
+) -> Vec<Value> {
+    let mut displayed: Vec<Value> = Vec::new();
+    let mut groups = HashMap::<String, usize>::new();
+    for entry in rows {
+        let Some(view) = views.get(&entry.id) else {
+            continue;
+        };
+        if group_bikes
+            && entry.kind == Kind::Expense
+            && entry.amount_cents == 0
+            && import::is_bike_ride(&entry.merchant, &entry.description)
+        {
+            let month = &entry.date[..7];
+            let index = *groups.entry(month.to_owned()).or_insert_with(|| {
+                displayed.push(json!({"row_type":"bike_group", "month":month,
+                    "count":0, "entries":[]}));
+                displayed.len() - 1
+            });
+            let group = &mut displayed[index];
+            let members = group["entries"].as_array_mut().expect("bike group entries");
+            members.push(view.clone());
+            group["count"] = json!(members.len());
+        } else {
+            displayed.push(view.clone());
+        }
+    }
+    displayed
 }
 
 fn entry_views(entries: &[Entry]) -> db::DbResult<HashMap<i64, Value>> {
@@ -345,7 +379,7 @@ async fn refund_targets(
         let entries = db::entries(c)?;
         let views = entry_views(&entries)?;
         let search = query.q.unwrap_or_default().to_lowercase();
-        let candidates: Vec<_> = entries.iter().filter(|e| e.kind == Kind::Expense
+        let candidates: Vec<_> = entries.iter().filter(|e| e.kind == Kind::Expense && e.amount_cents > 0
             && query.date.as_ref().is_none_or(|date| e.date <= *date)
             && (search.is_empty() || format!("{} {} {} {} {} {}.{:02}", e.date, e.merchant,
                 e.description, e.category, e.external_id.as_deref().unwrap_or(""), e.amount_cents / 100, e.amount_cents % 100)
@@ -354,7 +388,7 @@ async fn refund_targets(
         let mut selected: Vec<_> = candidates.into_iter().take(100).map(|e| e.id).collect();
         if let Some(id) = query.selected
             && !selected.contains(&id)
-            && entries.iter().any(|e| e.id == id && e.kind == Kind::Expense) {
+            && entries.iter().any(|e| e.id == id && e.kind == Kind::Expense && e.amount_cents > 0) {
             selected.push(id);
         }
         Ok(Json(json!({"entries":selected.iter().filter_map(|id|views.get(id)).collect::<Vec<_>>(),"total":total})))
@@ -381,8 +415,12 @@ async fn list_entries(
                 && (search.is_empty() || format!("{} {} {} {} {}",e.merchant,e.description,e.category,e.account,e.note).to_lowercase().contains(&search))
         }).collect();
         let total=rows.len();
+        // Group the complete filtered result before pagination so one month cannot
+        // be split into several partial ride counts across pages.
+        let displayed = display_entry_rows(&rows, &views, query.group_bikes.unwrap_or(false));
+        let display_total = displayed.len();
         let page=query.page.unwrap_or(1).clamp(1,10000);
-        Ok(Json(json!({"entries":rows.into_iter().skip((page-1)*50).take(50).filter_map(|e|views.get(&e.id)).collect::<Vec<_>>(),"total":total,"page":page})))
+        Ok(Json(json!({"entries":displayed.into_iter().skip((page-1)*50).take(50).collect::<Vec<_>>(),"total":total,"display_total":display_total,"page":page})))
     }).await.map_err(internal)
 }
 
@@ -488,7 +526,9 @@ pub fn make_summary(
         }
         if (e.date.starts_with(month) || amount != 0) && e.kind != Kind::Transfer {
             count += 1;
-            if e.category == "待分类" && (e.kind == Kind::Income || amount > 0) {
+            if e.category == "待分类"
+                && ((e.kind == Kind::Income && e.amount_cents > 0) || amount > 0)
+            {
                 unclassified += 1;
             }
         }
@@ -500,6 +540,7 @@ pub fn make_summary(
     let mut income_months = HashSet::new();
     for e in entries.iter().filter(|e| {
         e.kind == Kind::Income
+            && e.amount_cents > 0
             && e.date.starts_with(year)
             && e.date.as_str() >= start
             && e.date[..7] <= month[..]
@@ -795,6 +836,37 @@ mod tests {
     use super::*;
     use axum::body::{Body, to_bytes};
     use tower::ServiceExt;
+
+    #[test]
+    fn zero_records_do_not_change_income_averages_or_unclassified_totals() {
+        let mut salary = ledger::sample();
+        salary.kind = Kind::Income;
+        salary.split_start = None;
+        salary.split_months = None;
+        salary.date = "2026-07-01".into();
+        salary.category = "工资".into();
+        let mut zero = salary.clone();
+        zero.date = "2026-08-01".into();
+        zero.category = "待分类".into();
+        zero.amount_cents = 0;
+        let mut ride = zero.clone();
+        ride.kind = Kind::Expense;
+        let summary = make_summary(
+            &[salary.clone(), zero, ride],
+            "2026-07-01",
+            "2026-08",
+            false,
+        )
+        .unwrap();
+        assert_eq!(summary["income"], 0);
+        assert_eq!(summary["expense"], 0);
+        assert_eq!(summary["refund"], 0);
+        assert_eq!(summary["unclassified"], 0);
+        assert_eq!(summary["income_months"], 1);
+        assert_eq!(summary["income_average"], salary.amount_cents);
+        assert_eq!(summary["categories"], json!([]));
+        assert_eq!(summary["count"], 2);
+    }
 
     async fn app() -> Router {
         let db =

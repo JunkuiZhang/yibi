@@ -57,7 +57,16 @@ pub fn classify(kind: &Kind, merchant: &str, description: &str, rules: &[Rule]) 
             ),
             (
                 "交通出行",
-                &["滴滴", "地铁", "公交", "铁路", "12306", "高德打车"],
+                &[
+                    "滴滴",
+                    "地铁",
+                    "公交",
+                    "铁路",
+                    "12306",
+                    "高德打车",
+                    "单车",
+                    "骑行",
+                ],
             ),
             (
                 "餐饮",
@@ -86,6 +95,27 @@ pub fn classify(kind: &Kind, merchant: &str, description: &str, rules: &[Rule]) 
         .find(|(_, words)| words.iter().any(|w| text.contains(w)))
         .map(|(category, _)| (*category).to_owned())
         .unwrap_or_else(|| "待分类".into())
+}
+
+/// Monthly ride counts cover usage, not purchases of a pass or cycling equipment.
+pub fn is_bike_ride(merchant: &str, description: &str) -> bool {
+    let text = format!("{merchant} {description}");
+    (text.contains("单车") || text.contains("骑行"))
+        && ![
+            "会员",
+            "月卡",
+            "季卡",
+            "年卡",
+            "周卡",
+            "次卡",
+            "骑行卡",
+            "套餐",
+            "购车",
+            "配件",
+            "头盔",
+        ]
+        .iter()
+        .any(|word| description.contains(word))
 }
 
 pub fn parse(filename: &str, bytes: &[u8], rules: &[Rule]) -> Result<Preview, String> {
@@ -355,6 +385,7 @@ fn parse_table(table: Vec<Vec<String>>, rules: &[Rule]) -> Result<Preview, Strin
         }
         let category = classify(&kind, &merchant, &description, rules);
         if category == "待分类"
+            && amount > 0
             && (kind == Kind::Income || (kind == Kind::Expense && refunded_cents < amount))
         {
             warnings.push("尚未匹配分类，入账后可修改并保存商户规则".into());
@@ -425,7 +456,7 @@ fn parse_table(table: Vec<Vec<String>>, rules: &[Rule]) -> Result<Preview, Strin
 }
 
 fn imported_refund(kind: &Kind, status: &str, amount: i64, warnings: &mut Vec<String>) -> i64 {
-    if *kind != Kind::Expense || !status.contains('退') {
+    if *kind != Kind::Expense || amount == 0 || !status.contains('退') {
         return 0;
     }
     let refunded = if status == "已全额退款" {
@@ -467,6 +498,27 @@ fn clean(s: &str) -> &str {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn alipay_gbk_zero_rides_remain_individual_deduplicated_records() {
+        let csv = "支付宝交易明细\n交易时间,交易分类,交易对方,商品说明,收/支,金额,收/付款方式,交易状态,交易订单号\n2026-09-01 10:00:00,交通出行,测试出行,共享单车骑行,支出,0.00,支付宝,交易成功,bike-1\n2026-09-01 11:00:00,交通出行,测试出行,共享单车骑行,支出,0,支付宝,交易成功,bike-2\n2026-09-01 10:00:00,交通出行,测试出行,共享单车骑行,支出,0.00,支付宝,交易成功,bike-1\n2026-09-01 12:00:00,交通出行,测试出行,共享单车骑行,支出,1.50,支付宝,交易成功,bike-paid\n2026-09-01 13:00:00,其他,测试对象,测试零元收入,收入,0.00,支付宝,交易成功,zero-income\n2026-09-01 14:00:00,退款,测试对象,退款,收入,0.00,支付宝,退款成功,zero-refund\n";
+        let (bytes, _, errors) = encoding_rs::GBK.encode(csv);
+        assert!(!errors);
+        let preview = parse("alipay.csv", &bytes, &[]).unwrap();
+        assert_eq!(preview.source, "alipay");
+        assert_eq!(preview.rows.len(), 5);
+        assert_eq!(preview.errors.len(), 1); // A refund must represent actual money.
+        assert_eq!(preview.rows[0].entry.amount_cents, 0);
+        assert_eq!(preview.rows[0].entry.category, "交通出行");
+        assert!(!preview.rows[0].duplicate);
+        assert!(!preview.rows[1].duplicate);
+        assert!(preview.rows[2].duplicate);
+        assert!(preview.rows[4].warnings.is_empty());
+        assert!(is_bike_ride("测试出行", "共享单车骑行"));
+        for purchase in ["单车月卡", "骑行会员", "骑行卡套餐", "骑行头盔"] {
+            assert!(!is_bike_ride("测试出行", purchase));
+        }
+    }
 
     fn dated_workbook(date_1904: bool) -> Vec<u8> {
         let epoch = if date_1904 {
