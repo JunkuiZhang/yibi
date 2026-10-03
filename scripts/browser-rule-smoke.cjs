@@ -94,6 +94,10 @@ const config=JSON.parse(fs.readFileSync(process.env.TALLY_BROWSER_CONFIG,'utf8')
     await page.waitForFunction(()=>document.querySelector('#toast').textContent.includes('全部规则已应用'));
     assert.match(await page.locator('#toast').innerText(),/更新 1 笔分类/);
     assert.equal(await category(july),'重算分类');
+    await page.setViewportSize({width:390,height:844});
+    await page.locator('[data-action=apply-rules]').scrollIntoViewIfNeeded();
+    assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth),false);
+    await page.setViewportSize({width:1440,height:1000});
 
     const pending=await preview('rules-pending-add');
     assert.equal(pending.preview.rows[0].entry.category,'重算分类');
@@ -109,6 +113,6 @@ const config=JSON.parse(fs.readFileSync(process.env.TALLY_BROWSER_CONFIG,'utf8')
     assert.equal(imported.category,'待分类');
     assert.equal((await exported()).length,before.length+2);
     assert.deepEqual(errors,[]);
-    console.log(JSON.stringify({status:'passed',flows:['remember-updates-all-months','kind-and-merchant-scope','fields-and-refunds-preserved','settings-rule-save','longer-rule-priority','delete-falls-back','delete-unmatched-pending','apply-existing-rules','import-uses-latest-rules','deleted-rule-not-used-by-pending-import','authenticated-batch-route']}));
+    console.log(JSON.stringify({status:'passed',flows:['remember-updates-all-months','kind-and-merchant-scope','fields-and-refunds-preserved','settings-rule-save','longer-rule-priority','delete-falls-back','delete-unmatched-pending','apply-existing-rules','import-uses-latest-rules','deleted-rule-not-used-by-pending-import','authenticated-batch-route','mobile-settings-no-overflow']}));
   }finally{await browser.close();}
 })().catch(e=>{console.error(e);process.exitCode=1;});

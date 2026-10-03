@@ -122,16 +122,16 @@ sudo -u tally env TALLY_DB=/var/lib/tally/tally.sqlite3 \
 
 首次部署后应执行一次备份恢复演练，并确认金额、分摊计划和规则均完整。仓库中的 HTTP 冒烟测试已经验证在线备份的 SQLite 完整性与记录数量。
 
-## 6. 从 0.1 / 0.2 / 0.3 更新到 0.3.1（已有 Nginx/账户/账本）
+## 6. 从 0.1 / 0.2 / 0.3 更新到 0.4.0（已有 Nginx/账户/账本）
 
-0.3.1 修复分类下拉列表被当前文字限制的问题：点箭头可选择完整分类，也支持手动输入自定义分类。包含 0.3 的支付宝零元交易与共享单车按月汇总，以及 0.2 的微信 XLSX 日期修复与退款回冲。数据库结构仍为 v2；从 0.1 / 0.2 升级时自动迁移，保留账户、流水、分摊、退款关联和规则。无需运行 `init`，无需改 Nginx 或重新申请证书。
+0.4 保存分类规则时同步更新所有月份的匹配账单。删除规则后按剩余自定义规则重算，未命中则待分类。设置页提供“重新应用全部规则”，用于之前保存的规则。也包含 0.3.1 的完整分类选择与自定义分类输入修复。包含 0.3 的支付宝零元交易与共享单车按月汇总，以及 0.2 的微信 XLSX 日期修复与退款回冲。数据库结构仍为 v2；从 0.1 / 0.2 升级时自动迁移，保留账户、流水、分摊、退款关联和规则。无需运行 `init`，无需改 Nginx 或重新申请证书。
 
-将新包 `yibi-linux-x86_64-0.3.1.tar.gz` 上传到服务器 `/root/yibi/`。以下按当前 root 登录执行；先解包并核验：
+将新包 `yibi-linux-x86_64-0.4.0.tar.gz` 上传到服务器 `/root/yibi/`。以下按当前 root 登录执行；先解包并核验：
 
 ```sh
 cd /root/yibi
-tar -xzf yibi-linux-x86_64-0.3.1.tar.gz
-cd yibi-linux-x86_64-0.3.1
+tar -xzf yibi-linux-x86_64-0.4.0.tar.gz
+cd yibi-linux-x86_64-0.4.0
 sha256sum -c SHA256SUMS
 ./tally --help
 ```
@@ -145,7 +145,7 @@ sha256sum -c SHA256SUMS
   install -d -o tally -g tally -m 0700 /var/lib/tally/backups
   systemctl stop tally
   sudo -u tally env TALLY_DB=/var/lib/tally/tally.sqlite3 \
-    /opt/tally/tally backup "/var/lib/tally/backups/before-0.3.1-${YIBI_UPDATE_ID}.sqlite3"
+    /opt/tally/tally backup "/var/lib/tally/backups/before-0.4-${YIBI_UPDATE_ID}.sqlite3"
   cp -p /opt/tally/tally "/opt/tally/tally.before-${YIBI_UPDATE_ID}"
   install -m 0755 ./tally /opt/tally/tally
   systemctl start tally
@@ -155,9 +155,11 @@ sha256sum -c SHA256SUMS
 )
 ```
 
-若启动失败，执行 `journalctl -u tally -n 50 --no-pager` 查看原因。**0.1 / 0.2 程序不能打开 v2 数据库**；回退到这些版本时须停止服务，同时恢复本次保存的旧程序与 `before-0.3.1-…sqlite3` 备份。按上一节“备份与恢复”将当前主库及 `-wal`、`-shm` 移到保留目录后再恢复，避免混用。回退数据会撤销升级后的新增记录和修改。
+若启动失败，执行 `journalctl -u tally -n 50 --no-pager` 查看原因。**0.1 / 0.2 程序不能打开 v2 数据库**；回退到这些版本时须停止服务，同时恢复本次保存的旧程序与 `before-0.4-…sqlite3` 备份。按上一节“备份与恢复”将当前主库及 `-wal`、`-shm` 移到保留目录后再恢复，避免混用。回退数据会撤销升级后的新增记录和修改。
 
-更新后刷新浏览器，再导入支付宝原账单。如果旧版已导入 22 笔非零记录，新版会跳过它们并补入 118 笔零元记录；整份再次导入不会增加流水或骑行次数。每个月的零元共享单车合并显示，付费骑行和骑行卡费用独立显示。
+更新后刷新浏览器，在设置页点“重新应用全部规则”，即可按已有规则同步历史分类。未来保存规则会自动同步；删除规则会按剩余自定义规则重算匹配账单，未命中归待分类。
+
+可再导入支付宝原账单。如果旧版已导入 22 笔非零记录，新版会跳过它们并补入 118 笔零元记录；整份再次导入不会增加流水或骑行次数。每个月的零元共享单车合并显示，付费骑行和骑行卡费用独立显示。
 
 ## 当前边界
 
