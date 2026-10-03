@@ -5,7 +5,7 @@ use crate::{
 use calamine::{Data, Reader, Xlsx};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     io::{Cursor, Read},
 };
 
@@ -266,7 +266,6 @@ fn parse_table(table: Vec<Vec<String>>, rules: &[Rule]) -> Result<Preview, Strin
         skipped: 0,
         errors: Vec::new(),
     };
-    let mut seen = HashSet::new();
     for (index, row) in table.into_iter().enumerate().skip(header_index + 1) {
         if row.iter().all(|v| v.trim().is_empty()) {
             continue;
@@ -355,7 +354,9 @@ fn parse_table(table: Vec<Vec<String>>, rules: &[Rule]) -> Result<Preview, Strin
             );
         }
         let category = classify(&kind, &merchant, &description, rules);
-        if category == "待分类" {
+        if category == "待分类"
+            && (kind == Kind::Income || (kind == Kind::Expense && refunded_cents < amount))
+        {
             warnings.push("尚未匹配分类，入账后可修改并保存商户规则".into());
         }
         let method = get(&["支付方式", "付款方式", "收/付款方式"]);
@@ -393,9 +394,29 @@ fn parse_table(table: Vec<Vec<String>>, rules: &[Rule]) -> Result<Preview, Strin
         result.rows.push(PreviewRow {
             line: index + 1,
             entry,
-            duplicate: !seen.insert(external_id),
+            duplicate: false,
             warnings,
         });
+    }
+    // Repeated exports can contain older and newer statuses for one payment.
+    // Keep its largest cumulative refund regardless of row order.
+    let mut canonical = HashMap::<(String, String), usize>::new();
+    for index in 0..result.rows.len() {
+        let entry = &result.rows[index].entry;
+        let Some(id) = &entry.external_id else {
+            continue;
+        };
+        let key = (entry.source.clone(), id.clone());
+        if let Some(previous) = canonical.get(&key).copied() {
+            if entry.refunded_cents > result.rows[previous].entry.refunded_cents {
+                result.rows[previous].duplicate = true;
+                canonical.insert(key, index);
+            } else {
+                result.rows[index].duplicate = true;
+            }
+        } else {
+            canonical.insert(key, index);
+        }
     }
     if result.rows.is_empty() && result.errors.is_empty() {
         return Err("文件中没有可导入的成功交易".into());
@@ -605,6 +626,9 @@ mod tests {
             }
             if kind == Kind::Refund {
                 assert!(row.warnings.iter().any(|s| s.contains("仅留档")));
+            }
+            if kind == Kind::Refund || refunded == row.entry.amount_cents {
+                assert!(row.warnings.iter().all(|s| !s.contains("尚未匹配分类")));
             }
         }
     }

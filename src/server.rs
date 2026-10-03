@@ -644,25 +644,7 @@ async fn preview(State(state): State<AppState>, mut upload: Multipart) -> Result
                 .into_iter()
                 .filter_map(|e| e.external_id.clone().map(|id| ((e.source.clone(), id), e)))
                 .collect();
-            let mut seen = HashSet::new();
-            for row in &mut parsed.rows {
-                if let Some(id) = &row.entry.external_id {
-                    let key = (row.entry.source.clone(), id.clone());
-                    if let Some(previous) = existing.get(&key) {
-                        let update = refund_can_update(previous, &row.entry);
-                        row.duplicate = !update || !seen.insert(key);
-                        if update {
-                            row.warnings.push(
-                                "此支出已入账：更新累计退款金额，保留原分类、备注和分摊计划".into(),
-                            );
-                        } else if row.entry.refunded_cents > previous.amount_cents {
-                            row.warnings.push(
-                                "账单退款金额超过已保存的支出金额，请先核对并编辑原记录".into(),
-                            );
-                        }
-                    }
-                }
-            }
+            mark_saved_import_rows(&mut parsed, &existing);
             let token = auth::token();
             let now = Utc::now().timestamp();
             // Single owner: keep at most one active preview, never the uploaded original file.
@@ -696,6 +678,27 @@ fn refund_can_update(previous: &Entry, incoming: &Entry) -> bool {
         && incoming.kind == Kind::Expense
         && incoming.refunded_cents > previous.refunded_cents
         && incoming.refunded_cents <= previous.amount_cents
+}
+
+fn mark_saved_import_rows(parsed: &mut Preview, existing: &HashMap<(String, String), Entry>) {
+    for row in &mut parsed.rows {
+        if let Some(id) = &row.entry.external_id {
+            let key = (row.entry.source.clone(), id.clone());
+            if let Some(previous) = existing.get(&key) {
+                let update = refund_can_update(previous, &row.entry);
+                // The parser already chose the largest cumulative refund for
+                // this identity; do not replace that choice with the first row.
+                row.duplicate |= !update;
+                if update && !row.duplicate {
+                    row.warnings
+                        .push("此支出已入账：更新累计退款金额，保留原分类、备注和分摊计划".into());
+                } else if row.entry.refunded_cents > previous.amount_cents {
+                    row.warnings
+                        .push("账单退款金额超过已保存的支出金额，请先核对并编辑原记录".into());
+                }
+            }
+        }
+    }
 }
 
 async fn commit_import(
@@ -965,5 +968,51 @@ mod tests {
         assert_eq!(views[&1]["linked_refunded_cents"], 14800);
         assert_eq!(views[&2]["net_amount_cents"], 0);
         assert_eq!(views[&2]["refund_target"]["id"], 1);
+    }
+
+    #[test]
+    fn repeated_payment_statuses_keep_largest_refund_for_new_and_saved_imports() {
+        for statuses in [
+            ["已退款(¥20.00)", "已全额退款"],
+            ["已全额退款", "已退款(¥20.00)"],
+        ] {
+            let mut csv =
+                "交易时间,交易类型,交易对方,商品,收/支,金额(元),支付方式,当前状态,交易单号\n"
+                    .to_owned();
+            for status in statuses {
+                csv.push_str(&format!("2026-07-01 12:00:00,商户消费,合成商户,合成商品,支出,100.00,零钱,{status},synthetic-repeat\n"));
+            }
+            for saved_refund in [None, Some(0), Some(2000), Some(10000)] {
+                let mut parsed = import::parse("wechat.csv", csv.as_bytes(), &[]).unwrap();
+                assert!(parsed.errors.is_empty());
+                assert_eq!(parsed.rows.len(), 2);
+                let mut existing = HashMap::new();
+                if let Some(refunded) = saved_refund {
+                    let mut saved = parsed.rows[0].entry.clone();
+                    saved.id = 1;
+                    saved.refunded_cents = refunded;
+                    existing.insert(
+                        (saved.source.clone(), saved.external_id.clone().unwrap()),
+                        saved,
+                    );
+                }
+                mark_saved_import_rows(&mut parsed, &existing);
+                let selected: Vec<_> = parsed.rows.iter().filter(|row| !row.duplicate).collect();
+                if saved_refund == Some(10000) {
+                    assert!(selected.is_empty());
+                } else {
+                    assert_eq!(selected.len(), 1);
+                    assert_eq!(selected[0].entry.refunded_cents, 10000);
+                    assert_eq!(selected[0].entry.import_status, "已全额退款");
+                    assert_eq!(
+                        selected[0]
+                            .warnings
+                            .iter()
+                            .any(|s| s.contains("此支出已入账")),
+                        saved_refund.is_some()
+                    );
+                }
+            }
+        }
     }
 }
