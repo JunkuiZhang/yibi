@@ -17,7 +17,7 @@ use rusqlite::{OptionalExtension, params};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -65,6 +65,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/state", get(bootstrap))
         .route("/api/logout", post(logout))
         .route("/api/entries", get(list_entries).post(create_entry))
+        .route("/api/refund-targets", get(refund_targets))
         .route(
             "/api/entries/{id}",
             axum::routing::put(edit_entry).delete(remove_entry),
@@ -276,6 +277,89 @@ struct EntryQuery {
     mode: Option<String>,
     page: Option<usize>,
 }
+
+fn entry_views(entries: &[Entry]) -> db::DbResult<HashMap<i64, Value>> {
+    let totals = ledger::refund_totals(entries);
+    let lookup: HashMap<_, _> = entries.iter().map(|e| (e.id, e)).collect();
+    let mut linked = HashMap::<i64, i64>::new();
+    for e in entries.iter().filter(|e| e.kind == Kind::Refund) {
+        if let Some(id) = e.refund_of {
+            *linked.entry(id).or_default() += e.amount_cents;
+        }
+    }
+    entries
+        .iter()
+        .map(|e| {
+            let mut value = serde_json::to_value(e).map_err(|e| e.to_string())?;
+            let refunded = totals.get(&e.id).copied().unwrap_or(0);
+            value["refunded_total_cents"] = json!(refunded);
+            value["linked_refunded_cents"] = json!(linked.get(&e.id).copied().unwrap_or(0));
+            value["net_amount_cents"] = json!(match e.kind {
+                Kind::Expense => e.amount_cents - refunded,
+                Kind::Refund => 0,
+                _ => e.amount_cents,
+            });
+            value["refund_target"] = e
+                .refund_of
+                .and_then(|id| lookup.get(&id))
+                .map(|target| {
+                    json!({"id":target.id,"date":target.date,"merchant":target.merchant,
+                "description":target.description,"amount_cents":target.amount_cents})
+                })
+                .unwrap_or(Value::Null);
+            Ok((e.id, value))
+        })
+        .collect()
+}
+
+fn in_entry_month(entry: &Entry, month: &str, allocated: bool) -> bool {
+    if entry.date.starts_with(month) {
+        return true;
+    }
+    if allocated && let (Some(start), Some(count)) = (&entry.split_start, entry.split_months) {
+        return month >= start.as_str()
+            && ledger::add_months(start, count - 1).is_ok_and(|end| month <= end.as_str());
+    }
+    false
+}
+
+#[derive(Default, Deserialize)]
+struct RefundTargetQuery {
+    q: Option<String>,
+    date: Option<String>,
+    selected: Option<i64>,
+}
+
+async fn refund_targets(
+    State(state): State<AppState>,
+    Query(query): Query<RefundTargetQuery>,
+) -> Result<Json<Value>> {
+    if query
+        .date
+        .as_ref()
+        .is_some_and(|date| !ledger::valid_date(date))
+    {
+        return Err(bad("退款日期无效"));
+    }
+    state.db.run(move |c| {
+        let entries = db::entries(c)?;
+        let views = entry_views(&entries)?;
+        let search = query.q.unwrap_or_default().to_lowercase();
+        let candidates: Vec<_> = entries.iter().filter(|e| e.kind == Kind::Expense
+            && query.date.as_ref().is_none_or(|date| e.date <= *date)
+            && (search.is_empty() || format!("{} {} {} {} {} {}.{:02}", e.date, e.merchant,
+                e.description, e.category, e.external_id.as_deref().unwrap_or(""), e.amount_cents / 100, e.amount_cents % 100)
+                .to_lowercase().contains(&search))).collect();
+        let total = candidates.len();
+        let mut selected: Vec<_> = candidates.into_iter().take(100).map(|e| e.id).collect();
+        if let Some(id) = query.selected
+            && !selected.contains(&id)
+            && entries.iter().any(|e| e.id == id && e.kind == Kind::Expense) {
+            selected.push(id);
+        }
+        Ok(Json(json!({"entries":selected.iter().filter_map(|id|views.get(id)).collect::<Vec<_>>(),"total":total})))
+    }).await.map_err(internal)
+}
 async fn list_entries(
     State(state): State<AppState>,
     Query(query): Query<EntryQuery>,
@@ -286,10 +370,11 @@ async fn list_entries(
     state.db.run(move|c| {
         let start=db::setting(c,"ledger_start")?;
         let search=query.q.unwrap_or_default().to_lowercase();
-        let rows:Vec<_>=db::entries(c)?.into_iter().filter(|e| {
+        let entries = db::entries(c)?;
+        let views = entry_views(&entries)?;
+        let rows:Vec<_>=entries.iter().filter(|e| {
             let in_period=match &query.month {
-                Some(m) if query.mode.as_deref()==Some("allocated")=>e.date.starts_with(m) || e.expense_in(m,true)!=0,
-                Some(m)=>e.date.starts_with(m),
+                Some(m)=>in_entry_month(e,m,query.mode.as_deref()==Some("allocated")),
                 None=>e.date>=start,
             };
             in_period && query.kind.as_ref().is_none_or(|k|k.is_empty() || e.kind.as_str()==k)
@@ -297,7 +382,7 @@ async fn list_entries(
         }).collect();
         let total=rows.len();
         let page=query.page.unwrap_or(1).clamp(1,10000);
-        Ok(Json(json!({"entries":rows.into_iter().skip((page-1)*50).take(50).collect::<Vec<_>>(),"total":total,"page":page})))
+        Ok(Json(json!({"entries":rows.into_iter().skip((page-1)*50).take(50).filter_map(|e|views.get(&e.id)).collect::<Vec<_>>(),"total":total,"page":page})))
     }).await.map_err(internal)
 }
 
@@ -308,12 +393,13 @@ async fn create_entry(
     entry.id = 0;
     entry.source = "manual".into();
     entry.external_id = None;
+    entry.import_status.clear();
     entry.validate().map_err(bad)?;
     state
         .db
         .run(move |c| Ok(Json(json!({"id":db::insert(c,&entry)?}))))
         .await
-        .map_err(internal)
+        .map_err(bad)
 }
 async fn edit_entry(
     State(state): State<AppState>,
@@ -328,6 +414,7 @@ async fn edit_entry(
             entry.id = id;
             entry.source = previous.source;
             entry.external_id = previous.external_id;
+            entry.import_status = previous.import_status;
             db::update(c, &entry)?;
             Ok(Json(json!({"ok":true})))
         })
@@ -337,13 +424,9 @@ async fn edit_entry(
 async fn remove_entry(State(state): State<AppState>, Path(id): Path<i64>) -> Result<Json<Value>> {
     state
         .db
-        .run(move |c| {
-            c.execute("DELETE FROM entries WHERE id=?1", [id])
-                .map(|n| Json(json!({"deleted":n})))
-                .map_err(|e| e.to_string())
-        })
+        .run(move |c| db::remove(c, id).map(|n| Json(json!({"deleted":n}))))
         .await
-        .map_err(internal)
+        .map_err(bad)
 }
 
 #[derive(Deserialize)]
@@ -377,6 +460,8 @@ pub fn make_summary(
     month: &str,
     allocated: bool,
 ) -> db::DbResult<Value> {
+    let effective = ledger::effective_entries(entries);
+    let entries = effective.as_slice();
     let index = ledger::month_index(month)?;
     if month < &start[..7] {
         return Err("该月份早于正式记账起点".into());
@@ -390,20 +475,20 @@ pub fn make_summary(
     for e in entries {
         let amount = e.expense_in(month, allocated);
         expense += amount;
+        if e.kind == Kind::Expense {
+            let mut gross = e.clone();
+            gross.refunded_cents = 0;
+            refund += gross.expense_in(month, allocated) - amount;
+        }
         if amount != 0 {
             *categories.entry(e.category.clone()).or_default() += amount;
         }
-        if e.date.starts_with(month) {
-            if e.kind == Kind::Income {
-                income += e.amount_cents;
-            }
-            if e.kind == Kind::Refund {
-                refund += e.amount_cents;
-            }
+        if e.date.starts_with(month) && e.kind == Kind::Income {
+            income += e.amount_cents;
         }
         if (e.date.starts_with(month) || amount != 0) && e.kind != Kind::Transfer {
             count += 1;
-            if e.category == "待分类" {
+            if e.category == "待分类" && (e.kind == Kind::Income || amount > 0) {
                 unclassified += 1;
             }
         }
@@ -464,7 +549,11 @@ pub fn make_summary(
 }
 
 async fn subscriptions(State(state): State<AppState>) -> Result<Json<Value>> {
-    state.db.run(|c|Ok(Json(json!({"entries":db::entries(c)?.into_iter().filter(|e|e.split_start.is_some()).collect::<Vec<_>>()})))).await.map_err(internal)
+    state.db.run(|c| {
+        let entries = db::entries(c)?;
+        let views = entry_views(&entries)?;
+        Ok(Json(json!({"entries":entries.iter().filter(|e|e.split_start.is_some()).filter_map(|e|views.get(&e.id)).collect::<Vec<_>>()})))
+    }).await.map_err(internal)
 }
 
 #[derive(Deserialize)]
@@ -551,18 +640,27 @@ async fn preview(State(state): State<AppState>, mut upload: Multipart) -> Result
     state
         .db
         .run(move |c| {
-            let existing: HashSet<_> = db::entries(c)?
+            let existing: HashMap<_, _> = db::entries(c)?
                 .into_iter()
-                .filter_map(|e| e.external_id.map(|id| (e.source, id)))
+                .filter_map(|e| e.external_id.clone().map(|id| ((e.source.clone(), id), e)))
                 .collect();
+            let mut seen = HashSet::new();
             for row in &mut parsed.rows {
-                if row
-                    .entry
-                    .external_id
-                    .as_ref()
-                    .is_some_and(|id| existing.contains(&(row.entry.source.clone(), id.clone())))
-                {
-                    row.duplicate = true;
+                if let Some(id) = &row.entry.external_id {
+                    let key = (row.entry.source.clone(), id.clone());
+                    if let Some(previous) = existing.get(&key) {
+                        let update = refund_can_update(previous, &row.entry);
+                        row.duplicate = !update || !seen.insert(key);
+                        if update {
+                            row.warnings.push(
+                                "此支出已入账：更新累计退款金额，保留原分类、备注和分摊计划".into(),
+                            );
+                        } else if row.entry.refunded_cents > previous.amount_cents {
+                            row.warnings.push(
+                                "账单退款金额超过已保存的支出金额，请先核对并编辑原记录".into(),
+                            );
+                        }
+                    }
                 }
             }
             let token = auth::token();
@@ -592,6 +690,14 @@ struct Commit {
     token: String,
     indices: Vec<usize>,
 }
+
+fn refund_can_update(previous: &Entry, incoming: &Entry) -> bool {
+    previous.kind == Kind::Expense
+        && incoming.kind == Kind::Expense
+        && incoming.refunded_cents > previous.refunded_cents
+        && incoming.refunded_cents <= previous.amount_cents
+}
+
 async fn commit_import(
     State(state): State<AppState>,
     Json(input): Json<Commit>,
@@ -616,6 +722,11 @@ async fn commit_import(
                     .map_err(|e| e.to_string())?;
             let mut inserted = 0;
             let mut skipped = 0;
+            let mut updated = 0;
+            let mut existing: HashMap<_, _> = db::entries(&tx)?
+                .into_iter()
+                .filter_map(|e| e.external_id.clone().map(|id| ((e.source.clone(), id), e)))
+                .collect();
             let mut seen = HashSet::new();
             for index in input.indices {
                 if !seen.insert(index) {
@@ -626,6 +737,20 @@ async fn commit_import(
                     skipped += 1;
                     continue;
                 }
+                if let Some(external_id) = &row.entry.external_id {
+                    let key = (row.entry.source.clone(), external_id.clone());
+                    if let Some(previous) = existing.get_mut(&key) {
+                        if refund_can_update(previous, &row.entry) {
+                            previous.refunded_cents = row.entry.refunded_cents;
+                            previous.import_status = row.entry.import_status.clone();
+                            db::update(&tx, previous)?;
+                            updated += 1;
+                        } else {
+                            skipped += 1;
+                        }
+                        continue;
+                    }
+                }
                 if db::insert(&tx, &row.entry)?.is_some() {
                     inserted += 1;
                 } else {
@@ -635,7 +760,9 @@ async fn commit_import(
             tx.execute("DELETE FROM previews WHERE token=?1", [input.token])
                 .map_err(|e| e.to_string())?;
             tx.commit().map_err(|e| e.to_string())?;
-            Ok(Json(json!({"inserted":inserted,"skipped":skipped})))
+            Ok(Json(
+                json!({"inserted":inserted,"skipped":skipped,"updated":updated}),
+            ))
         })
         .await
         .map_err(bad)
@@ -684,6 +811,7 @@ mod tests {
             "/api/summary?month=2026-07",
             "/api/subscriptions",
             "/api/export",
+            "/api/refund-targets",
         ] {
             let r = app
                 .clone()
@@ -783,20 +911,59 @@ mod tests {
         let mut transfer = salary.clone();
         transfer.kind = Kind::Transfer;
         let mut expense = ledger::sample();
+        expense.id = 10;
         expense.date = "2026-07-01".into();
         let mut refund = expense.clone();
         refund.kind = Kind::Refund;
         refund.split_start = None;
         refund.split_months = None;
         refund.amount_cents = 500;
+        refund.id = 11;
+        refund.refund_of = Some(expense.id);
         let rows = vec![salary, bonus, transfer, expense, refund];
         let cash = make_summary(&rows, "2026-07-01", "2026-07", false).unwrap();
         assert_eq!(cash["income"], 3_500_000);
         assert_eq!(cash["expense"], 14_300);
-        assert_eq!(cash["pending"], 14_800);
+        assert_eq!(cash["pending"], 14_300);
         assert_eq!(cash["income_months"], 1);
         assert_eq!(cash["bonus"], 1_000_000);
         let accrual = make_summary(&rows, "2026-07-01", "2027-02", true).unwrap();
-        assert_eq!(accrual["expense"], 1234);
+        assert_eq!(accrual["expense"], 1192);
+    }
+
+    #[test]
+    fn refunds_restate_original_month_and_keep_auditable_zero_rows() {
+        let mut expense = ledger::sample();
+        expense.id = 1;
+        expense.date = "2026-07-01".into();
+        expense.category = "待分类".into();
+        expense.refunded_cents = 14800;
+        let mut refund = expense.clone();
+        refund.id = 2;
+        refund.date = "2026-09-01".into();
+        refund.kind = Kind::Refund;
+        refund.refunded_cents = 0;
+        refund.split_start = None;
+        refund.split_months = None;
+        refund.refund_of = Some(1);
+        let rows = vec![expense.clone(), refund];
+        let july = make_summary(&rows, "2026-07-01", "2026-07", false).unwrap();
+        assert_eq!(july["expense"], 0);
+        assert_eq!(july["refund"], 14800);
+        assert_eq!(july["unclassified"], 0);
+        assert_eq!(july["pending"], 0);
+        let september = make_summary(&rows, "2026-07-01", "2026-09", false).unwrap();
+        assert_eq!(september["expense"], 0);
+        assert_eq!(september["income"], 0);
+        assert_eq!(september["months"][0]["expense"], 0);
+        assert!(in_entry_month(&expense, "2027-02", true));
+        assert!(in_entry_month(&expense, "2028-01", true));
+        assert!(!in_entry_month(&expense, "2028-02", true));
+        let views = entry_views(&rows).unwrap();
+        assert_eq!(views[&1]["amount_cents"], 14800);
+        assert_eq!(views[&1]["net_amount_cents"], 0);
+        assert_eq!(views[&1]["linked_refunded_cents"], 14800);
+        assert_eq!(views[&2]["net_amount_cents"], 0);
+        assert_eq!(views[&2]["refund_target"]["id"], 1);
     }
 }

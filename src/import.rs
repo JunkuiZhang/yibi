@@ -303,6 +303,11 @@ fn parse_table(table: Vec<Vec<String>>, rules: &[Rule]) -> Result<Preview, Strin
             "收入" if detail.contains("退款") || detail.contains("退货") => Kind::Refund,
             "收入" => Kind::Income,
             "支出" => Kind::Expense,
+            "不计收支" | "不计收入支出" | "其他" | "/" | "-"
+                if trade_type.contains("退款") || trade_type.contains("退货") =>
+            {
+                Kind::Refund
+            }
             "不计收支" | "不计收入支出" | "其他" | "/" | "-" => Kind::Transfer,
             _ => {
                 result
@@ -343,9 +348,10 @@ fn parse_table(table: Vec<Vec<String>>, rules: &[Rule]) -> Result<Preview, Strin
         } else {
             format!("{id}:{}", kind.as_str())
         };
-        if kind == Kind::Expense && status.contains("退") {
+        let refunded_cents = imported_refund(&kind, &status, amount, &mut warnings);
+        if kind == Kind::Refund {
             warnings.push(
-                "原付款包含退款状态，仍保留原付款；请核对并另记实际退款，避免遗漏或重复".into(),
+                "退款流水仅留档，不另计收支；若原支出未注明退款，可入账后手动关联原支出".into(),
             );
         }
         let category = classify(&kind, &merchant, &description, rules);
@@ -367,6 +373,9 @@ fn parse_table(table: Vec<Vec<String>>, rules: &[Rule]) -> Result<Preview, Strin
             date,
             kind,
             amount_cents: amount,
+            refunded_cents,
+            refund_of: None,
+            import_status: status,
             merchant,
             description,
             category,
@@ -392,6 +401,38 @@ fn parse_table(table: Vec<Vec<String>>, rules: &[Rule]) -> Result<Preview, Strin
         return Err("文件中没有可导入的成功交易".into());
     }
     Ok(result)
+}
+
+fn imported_refund(kind: &Kind, status: &str, amount: i64, warnings: &mut Vec<String>) -> i64 {
+    if *kind != Kind::Expense || !status.contains('退') {
+        return 0;
+    }
+    let refunded = if status == "已全额退款" {
+        Some(amount)
+    } else {
+        status.strip_prefix("已退款").and_then(|value| {
+            let value = value.trim();
+            let value = value
+                .strip_prefix('(')
+                .and_then(|v| v.strip_suffix(')'))
+                .or_else(|| value.strip_prefix('（').and_then(|v| v.strip_suffix('）')))
+                .unwrap_or(value)
+                .trim();
+            let value = value.strip_suffix('元').unwrap_or(value).trim();
+            parse_money(value).ok().filter(|n| *n <= amount)
+        })
+    };
+    if let Some(refunded) = refunded {
+        warnings.push(format!(
+            "原支出累计退款 ¥{}.{:02} 将抵扣原支出月份；独立退款流水不再重复扣减",
+            refunded / 100,
+            refunded % 100
+        ));
+        refunded
+    } else {
+        warnings.push("原支出含退款状态，但无法确认有效退款金额；暂按原额记账，请核对后补填累计退款或关联退款流水".into());
+        0
+    }
 }
 
 fn clean(s: &str) -> &str {
@@ -523,6 +564,51 @@ mod tests {
         assert_ne!(p.rows[0].entry.external_id, p.rows[2].entry.external_id);
         assert_eq!(p.rows[3].entry.kind, Kind::Transfer);
     }
+
+    #[test]
+    fn refund_statuses_reduce_expenses_and_refund_rows_remain_audit_records() {
+        let cases = [
+            ("支出", "商户消费", "已全额退款", Kind::Expense, 10000),
+            ("支出", "商户消费", "已退款(¥20.01)", Kind::Expense, 2001),
+            ("支出", "商户消费", "已退款¥20.01", Kind::Expense, 2001),
+            (
+                "支出",
+                "商户消费",
+                "已退款（￥20.01元）",
+                Kind::Expense,
+                2001,
+            ),
+            ("支出", "商户消费", "退款处理中", Kind::Expense, 0),
+            ("支出", "商户消费", "已退款(¥101.00)", Kind::Expense, 0),
+            ("支出", "商户消费", "已退款(¥错误)", Kind::Expense, 0),
+            ("收入", "商户退款", "已全额退款", Kind::Refund, 0),
+            ("不计收支", "商户退款", "退款成功", Kind::Refund, 0),
+            ("/", "商户退款", "退款成功", Kind::Refund, 0),
+            ("不计收支", "提现", "成功", Kind::Transfer, 0),
+        ];
+        let mut csv = "交易时间,交易类型,交易对方,商品,收/支,金额(元),支付方式,当前状态,交易单号\n"
+            .to_owned();
+        for (index, (direction, trade_type, status, _, _)) in cases.iter().enumerate() {
+            csv.push_str(&format!("2026-07-01 12:00:00,{trade_type},合成商户,合成商品,{direction},100.00,零钱,{status},synthetic-{index}\n"));
+        }
+        let preview = parse("wechat.csv", csv.as_bytes(), &[]).unwrap();
+        assert!(preview.errors.is_empty());
+        assert_eq!(preview.rows.len(), cases.len());
+        for (row, (_, _, status, kind, refunded)) in preview.rows.iter().zip(cases) {
+            assert_eq!(row.entry.kind, kind);
+            assert_eq!(row.entry.amount_cents, 10000);
+            assert_eq!(row.entry.refunded_cents, refunded);
+            assert_eq!(row.entry.import_status, status);
+            assert_eq!(row.entry.refund_of, None);
+            if kind == Kind::Expense && refunded == 0 {
+                assert!(row.warnings.iter().any(|s| s.contains("无法确认")));
+            }
+            if kind == Kind::Refund {
+                assert!(row.warnings.iter().any(|s| s.contains("仅留档")));
+            }
+        }
+    }
+
     #[test]
     fn alipay_gbk_and_rules() {
         let csv = "支付宝交易记录明细\n交易时间,交易分类,交易对方,商品说明,收/支,金额,收/付款方式,交易状态,交易订单号\n2026-07-02 10:20:30,购物,我的小店,商品,支出,148.00,花呗,交易成功,ali1\n";

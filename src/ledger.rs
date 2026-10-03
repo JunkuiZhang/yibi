@@ -1,5 +1,6 @@
 use chrono::{Datelike, NaiveDate};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 pub const DEFAULT_START: &str = "2026-07-01";
 pub const MAX_AMOUNT: i64 = 100_000_000_000;
@@ -31,6 +32,12 @@ pub struct Entry {
     pub date: String,
     pub kind: Kind,
     pub amount_cents: i64,
+    #[serde(default)]
+    pub refunded_cents: i64,
+    #[serde(default)]
+    pub refund_of: Option<i64>,
+    #[serde(default)]
+    pub import_status: String,
     pub merchant: String,
     #[serde(default)]
     pub description: String,
@@ -57,12 +64,26 @@ impl Entry {
         if !(1..=MAX_AMOUNT).contains(&self.amount_cents) {
             return Err("金额必须大于零且不超过十亿元".into());
         }
+        if self.kind == Kind::Expense {
+            if !(0..=self.amount_cents).contains(&self.refunded_cents) {
+                return Err("累计退款金额不能小于零或超过原支出金额".into());
+            }
+        } else if self.refunded_cents != 0 {
+            return Err("只有支出可设置累计退款金额".into());
+        }
+        if self.refund_of.is_some_and(|id| id <= 0) {
+            return Err("关联支出的记录编号必须大于零".into());
+        }
+        if self.refund_of.is_some() && self.kind != Kind::Refund {
+            return Err("只有退款流水可关联原支出".into());
+        }
         for (text, max, label) in [
             (&self.merchant, 200, "交易对象"),
             (&self.description, 500, "商品说明"),
             (&self.category, 60, "分类"),
             (&self.account, 60, "账户"),
             (&self.note, 1000, "备注"),
+            (&self.import_status, 200, "原始交易状态"),
         ] {
             if text.chars().count() > max || text.chars().any(|c| c == '\0') {
                 return Err(format!("{label}过长或包含无效字符"));
@@ -88,31 +109,57 @@ impl Entry {
     }
 
     pub fn expense_in(&self, month: &str, allocated: bool) -> i64 {
-        if self.kind == Kind::Refund {
-            return if self.date.starts_with(month) {
-                -self.amount_cents
-            } else {
-                0
-            };
-        }
         if self.kind != Kind::Expense {
             return 0;
         }
+        let net = self.amount_cents - self.refunded_cents;
         if allocated && let (Some(start), Some(count)) = (&self.split_start, self.split_months) {
             let offset = month_index(month).unwrap_or(-1) - month_index(start).unwrap_or(-1);
             if offset < 0 || offset >= count as i32 {
                 return 0;
             }
             // Give the first remainder months one extra cent: exact sum, at most 1 cent apart.
-            return self.amount_cents / count as i64
-                + i64::from((offset as i64) < self.amount_cents % count as i64);
+            return net / count as i64 + i64::from((offset as i64) < net % count as i64);
         }
-        if self.date.starts_with(month) {
-            self.amount_cents
-        } else {
-            0
+        if self.date.starts_with(month) { net } else { 0 }
+    }
+}
+
+/// Exported cumulative refunds and linked refund rows may describe the same money.
+/// Use the larger total so importing both representations never deducts it twice.
+pub fn refund_totals(entries: &[Entry]) -> HashMap<i64, i64> {
+    let mut linked = HashMap::<i64, i64>::new();
+    for refund in entries.iter().filter(|e| e.kind == Kind::Refund) {
+        if let Some(id) = refund.refund_of {
+            let total = linked.entry(id).or_default();
+            *total = total.saturating_add(refund.amount_cents.max(0));
         }
     }
+    entries
+        .iter()
+        .filter(|e| e.kind == Kind::Expense)
+        .map(|e| {
+            let total = e
+                .refunded_cents
+                .max(linked.get(&e.id).copied().unwrap_or(0))
+                .clamp(0, e.amount_cents.max(0));
+            (e.id, total)
+        })
+        .collect()
+}
+
+pub fn effective_entries(entries: &[Entry]) -> Vec<Entry> {
+    let totals = refund_totals(entries);
+    entries
+        .iter()
+        .cloned()
+        .map(|mut e| {
+            if e.kind == Kind::Expense {
+                e.refunded_cents = totals.get(&e.id).copied().unwrap_or(0);
+            }
+            e
+        })
+        .collect()
 }
 
 pub fn valid_date(value: &str) -> bool {
@@ -186,6 +233,9 @@ pub(crate) fn sample() -> Entry {
         date: "2026-10-04".into(),
         kind: Kind::Expense,
         amount_cents: 14800,
+        refunded_cents: 0,
+        refund_of: None,
+        import_status: String::new(),
         merchant: "视频会员".into(),
         description: String::new(),
         category: "会员订阅".into(),
@@ -241,5 +291,101 @@ mod tests {
         }
         assert!(!valid_date("2026-02-30"));
         assert!(month_index("2027-13").is_err());
+    }
+
+    fn refund(id: i64, parent: Option<i64>, date: &str, amount: i64) -> Entry {
+        let mut e = sample();
+        e.id = id;
+        e.kind = Kind::Refund;
+        e.date = date.into();
+        e.amount_cents = amount;
+        e.refund_of = parent;
+        e.split_start = None;
+        e.split_months = None;
+        e
+    }
+
+    #[test]
+    fn refunds_adjust_original_month_without_double_counting_export_status() {
+        let mut expense = sample();
+        expense.id = 1;
+        expense.refunded_cents = 3000;
+        let entries = vec![
+            expense,
+            refund(2, Some(1), "2026-11-01", 2000),
+            refund(3, Some(1), "2026-12-01", 1000),
+            refund(4, None, "2026-10-05", 9999),
+        ];
+        let effective = effective_entries(&entries);
+        assert_eq!(refund_totals(&entries)[&1], 3000);
+        assert_eq!(effective[0].expense_in("2026-10", false), 11800);
+        for month in ["2026-11", "2026-12"] {
+            assert_eq!(
+                effective
+                    .iter()
+                    .map(|e| e.expense_in(month, false))
+                    .sum::<i64>(),
+                0
+            );
+        }
+        assert_eq!(effective[3].expense_in("2026-10", false), 0);
+        let mut adjusted = entries.clone();
+        adjusted[0].refunded_cents = 0;
+        assert_eq!(refund_totals(&adjusted)[&1], 3000);
+        assert_eq!(entries[0].refunded_cents, 3000);
+        assert_eq!(adjusted[0].refunded_cents, 0);
+        adjusted.push(refund(5, Some(1), "2027-01-01", 11800));
+        let effective = effective_entries(&adjusted);
+        assert_eq!(effective[0].expense_in("2026-10", false), 0);
+        assert_eq!(effective[0].expense_in("2027-02", true), 0);
+    }
+
+    #[test]
+    fn refunded_membership_preserves_original_schedule_and_exact_net_sum() {
+        let mut expense = sample();
+        expense.id = 1;
+        let entries = vec![expense, refund(2, Some(1), "2027-06-01", 4001)];
+        let e = &effective_entries(&entries)[0];
+        assert_eq!(e.expense_in("2026-10", false), 10799);
+        assert_eq!(e.expense_in("2027-01", true), 0);
+        assert_eq!(e.expense_in("2028-02", true), 0);
+        let parts: Vec<_> = (0..12)
+            .map(|i| e.expense_in(&add_months("2027-02", i).unwrap(), true))
+            .collect();
+        assert_eq!(parts.iter().sum::<i64>(), 10799);
+        assert_eq!(parts.iter().max().unwrap() - parts.iter().min().unwrap(), 1);
+    }
+
+    #[test]
+    fn old_payload_defaults_and_refund_metadata_validation() {
+        let mut payload = serde_json::to_value(sample()).unwrap();
+        for field in ["refunded_cents", "refund_of", "import_status"] {
+            payload.as_object_mut().unwrap().remove(field);
+        }
+        let old: Entry = serde_json::from_value(payload).unwrap();
+        assert_eq!(old.refunded_cents, 0);
+        assert_eq!(old.refund_of, None);
+        assert!(old.import_status.is_empty());
+        old.validate().unwrap();
+
+        let mut invalid = old.clone();
+        invalid.refunded_cents = -1;
+        assert!(invalid.validate().is_err());
+        invalid.refunded_cents = invalid.amount_cents + 1;
+        assert!(invalid.validate().is_err());
+        invalid.refunded_cents = invalid.amount_cents;
+        invalid.validate().unwrap();
+        invalid.refund_of = Some(1);
+        assert!(invalid.validate().is_err());
+        invalid = refund(2, Some(0), "2026-11-01", 100);
+        assert!(invalid.validate().is_err());
+        invalid.refund_of = None;
+        invalid.refunded_cents = 1;
+        assert!(invalid.validate().is_err());
+        invalid = old;
+        invalid.import_status = "x".repeat(201);
+        assert!(invalid.validate().is_err());
+        invalid.import_status = "已退款\0".into();
+        assert!(invalid.validate().is_err());
     }
 }
