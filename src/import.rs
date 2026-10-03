@@ -20,6 +20,19 @@ pub struct Rule {
     pub kind: Kind,
 }
 
+impl Rule {
+    pub fn matches(&self, kind: &Kind, merchant: &str) -> bool {
+        self.kind == *kind
+            && merchant
+                .to_lowercase()
+                .contains(&self.pattern.to_lowercase())
+    }
+}
+
+pub fn matching_rule<'a>(kind: &Kind, merchant: &str, rules: &'a [Rule]) -> Option<&'a Rule> {
+    rules.iter().find(|rule| rule.matches(kind, merchant))
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct PreviewRow {
     pub line: usize,
@@ -37,11 +50,8 @@ pub struct Preview {
 }
 
 pub fn classify(kind: &Kind, merchant: &str, description: &str, rules: &[Rule]) -> String {
-    let name = merchant.to_lowercase();
-    for rule in rules {
-        if rule.kind == *kind && name.contains(&rule.pattern.to_lowercase()) {
-            return rule.category.clone();
-        }
+    if let Some(rule) = matching_rule(kind, merchant, rules) {
+        return rule.category.clone();
     }
     let text = format!("{merchant} {description}").to_lowercase();
     let patterns: &[(&str, &[&str])] = match kind {

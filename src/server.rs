@@ -73,6 +73,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/summary", get(summary))
         .route("/api/subscriptions", get(subscriptions))
         .route("/api/rules", post(save_rule))
+        .route("/api/rules/apply", post(apply_rules))
         .route("/api/rules/{id}", delete(remove_rule))
         .route("/api/settings", axum::routing::put(save_settings))
         .route("/api/import/preview", post(preview))
@@ -603,29 +604,126 @@ struct RuleInput {
     category: String,
     kind: Kind,
 }
+
+fn reclassify_matching(
+    conn: &rusqlite::Connection,
+    scopes: &[Rule],
+    rules: &[Rule],
+) -> db::DbResult<Value> {
+    let mut matched = 0;
+    let mut updated = 0;
+    let mut stmt = conn
+        .prepare("UPDATE entries SET payload=json_set(payload,'$.category',?1) WHERE id=?2")
+        .map_err(|e| e.to_string())?;
+    for entry in db::entries(conn)? {
+        if !scopes
+            .iter()
+            .any(|rule| rule.matches(&entry.kind, &entry.merchant))
+        {
+            continue;
+        }
+        matched += 1;
+        let category = import::matching_rule(&entry.kind, &entry.merchant, rules)
+            .map(|rule| rule.category.as_str())
+            .unwrap_or("待分类");
+        if category != entry.category {
+            if category.trim().is_empty()
+                || category.chars().count() > 60
+                || category.contains('\0')
+            {
+                return Err("请输入有效分类".into());
+            }
+            // Only the category changes: retain even unknown payload fields and
+            // avoid revalidating all refund links for each row in a large batch.
+            updated += stmt
+                .execute(params![category, entry.id])
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(json!({"ok":true,"matched":matched,"updated":updated}))
+}
+
+fn store_rule(conn: &mut rusqlite::Connection, input: RuleInput) -> db::DbResult<Value> {
+    let pattern = input.pattern.trim();
+    let category = input.category.trim();
+    if pattern.is_empty()
+        || pattern.chars().count() > 200
+        || pattern.contains('\0')
+        || category.is_empty()
+        || category.chars().count() > 60
+        || category.contains('\0')
+    {
+        return Err("请输入有效的商户关键词和分类".into());
+    }
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    let old_id: Option<i64> = tx
+        .query_row("SELECT id FROM rules WHERE pattern=?1", [pattern], |row| {
+            row.get(0)
+        })
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let previous = load_rules(&tx)?
+        .into_iter()
+        .find(|rule| Some(rule.id) == old_id);
+    tx.execute("INSERT INTO rules(pattern,category,kind) VALUES (?1,?2,?3) ON CONFLICT(pattern) DO UPDATE SET category=excluded.category,kind=excluded.kind",
+        params![pattern, category, input.kind.as_str()]).map_err(|e| e.to_string())?;
+    let mut scopes = vec![Rule {
+        id: 0,
+        pattern: pattern.into(),
+        category: category.into(),
+        kind: input.kind,
+    }];
+    // Replacing a rule's kind also removes its old scope, just like deleting it.
+    if let Some(previous) = previous {
+        scopes.push(previous);
+    }
+    let result = reclassify_matching(&tx, &scopes, &load_rules(&tx)?)?;
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(result)
+}
+
+fn delete_rule(conn: &mut rusqlite::Connection, id: i64) -> db::DbResult<Value> {
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    let scopes: Vec<_> = load_rules(&tx)?
+        .into_iter()
+        .filter(|rule| rule.id == id)
+        .collect();
+    tx.execute("DELETE FROM rules WHERE id=?1", [id])
+        .map_err(|e| e.to_string())?;
+    let result = reclassify_matching(&tx, &scopes, &load_rules(&tx)?)?;
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(result)
+}
+
 async fn save_rule(
     State(state): State<AppState>,
     Json(rule): Json<RuleInput>,
 ) -> Result<Json<Value>> {
-    if rule.pattern.trim().is_empty()
-        || rule.pattern.chars().count() > 200
-        || rule.category.trim().is_empty()
-        || rule.category.chars().count() > 60
-    {
-        return Err(bad("请输入有效的商户关键词和分类"));
-    }
-    state.db.run(move|c|c.execute("INSERT INTO rules(pattern,category,kind) VALUES (?1,?2,?3) ON CONFLICT(pattern) DO UPDATE SET category=excluded.category,kind=excluded.kind",params![rule.pattern.trim(),rule.category.trim(),rule.kind.as_str()]).map(|_|Json(json!({"ok":true}))).map_err(|e|e.to_string())).await.map_err(internal)
+    state
+        .db
+        .run(move |c| store_rule(c, rule).map(Json))
+        .await
+        .map_err(bad)
 }
 async fn remove_rule(State(state): State<AppState>, Path(id): Path<i64>) -> Result<Json<Value>> {
     state
         .db
-        .run(move |c| {
-            c.execute("DELETE FROM rules WHERE id=?1", [id])
-                .map(|_| Json(json!({"ok":true})))
-                .map_err(|e| e.to_string())
+        .run(move |c| delete_rule(c, id).map(Json))
+        .await
+        .map_err(bad)
+}
+async fn apply_rules(State(state): State<AppState>) -> Result<Json<Value>> {
+    state
+        .db
+        .run(|c| {
+            let tx = c.transaction().map_err(|e| e.to_string())?;
+            let rules = load_rules(&tx)?;
+            let result = reclassify_matching(&tx, &rules, &rules)?;
+            tx.commit().map_err(|e| e.to_string())?;
+            Ok(Json(result))
         })
         .await
-        .map_err(internal)
+        .map_err(bad)
 }
 
 #[derive(Deserialize)]
@@ -772,6 +870,7 @@ async fn commit_import(
                 .filter_map(|e| e.external_id.clone().map(|id| ((e.source.clone(), id), e)))
                 .collect();
             let mut seen = HashSet::new();
+            let rules = load_rules(&tx)?;
             for index in input.indices {
                 if !seen.insert(index) {
                     continue;
@@ -795,7 +894,10 @@ async fn commit_import(
                         continue;
                     }
                 }
-                if db::insert(&tx, &row.entry)?.is_some() {
+                let mut entry = row.entry.clone();
+                entry.category =
+                    import::classify(&entry.kind, &entry.merchant, &entry.description, &rules);
+                if db::insert(&tx, &entry)?.is_some() {
                     inserted += 1;
                 } else {
                     skipped += 1;
@@ -836,6 +938,184 @@ mod tests {
     use super::*;
     use axum::body::{Body, to_bytes};
     use tower::ServiceExt;
+
+    fn rule_input(pattern: &str, category: &str, kind: Kind) -> RuleInput {
+        RuleInput {
+            pattern: pattern.into(),
+            category: category.into(),
+            kind,
+        }
+    }
+
+    fn rule_id(conn: &rusqlite::Connection, pattern: &str) -> i64 {
+        conn.query_row("SELECT id FROM rules WHERE pattern=?1", [pattern], |row| {
+            row.get(0)
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn saved_rules_update_all_dates_and_only_category_payload_fields() {
+        let db =
+            Database::from_connection(rusqlite::Connection::open_in_memory().unwrap()).unwrap();
+        let mut conn = db.0.lock().unwrap();
+        let mut member = ledger::sample();
+        member.merchant = "合成自如商户".into();
+        member.date = "2025-02-01".into();
+        member.category = "人工旧分类".into();
+        member.source = "wechat".into();
+        member.external_id = Some("synthetic-member".into());
+        let id = db::insert(&conn, &member).unwrap().unwrap();
+        conn.execute("UPDATE entries SET payload=json_set(payload,'$.future_field','preserve-me') WHERE id=?1",[id]).unwrap();
+        let mut zero = member.clone();
+        zero.date = "2026-09-01".into();
+        zero.amount_cents = 0;
+        zero.external_id = None;
+        zero.split_start = None;
+        zero.split_months = None;
+        let zero_id = db::insert(&conn, &zero).unwrap().unwrap();
+        let mut refund = zero.clone();
+        refund.kind = Kind::Refund;
+        refund.amount_cents = 500;
+        refund.refund_of = Some(id);
+        db::insert(&conn, &refund).unwrap();
+        let mut income = zero.clone();
+        income.kind = Kind::Income;
+        db::insert(&conn, &income).unwrap();
+        let mut unrelated = zero.clone();
+        unrelated.merchant = "另一个商户".into();
+        unrelated.description = "自如商品".into();
+        db::insert(&conn, &unrelated).unwrap();
+        let snapshot = |conn: &rusqlite::Connection| {
+            let mut stmt = conn
+                .prepare("SELECT id,payload FROM entries ORDER BY id")
+                .unwrap();
+            stmt.query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .map(|row| {
+                let (id, payload) = row.unwrap();
+                (id, serde_json::from_str::<Value>(&payload).unwrap())
+            })
+            .collect::<HashMap<_, _>>()
+        };
+        let before = snapshot(&conn);
+        let result =
+            store_rule(&mut conn, rule_input(" 自如 ", " 居家生活 ", Kind::Expense)).unwrap();
+        assert_eq!(result, json!({"ok":true,"matched":2,"updated":2}));
+        for (identifier, mut after) in snapshot(&conn) {
+            let mut old = before[&identifier].clone();
+            if identifier == id || identifier == zero_id {
+                assert_eq!(after["category"], "居家生活");
+            } else {
+                assert_eq!(after["category"], old["category"]);
+            }
+            after.as_object_mut().unwrap().remove("category");
+            old.as_object_mut().unwrap().remove("category");
+            assert_eq!(after, old);
+        }
+        assert_eq!(db::entry(&conn, id).unwrap().unwrap().category, "居家生活");
+        assert_eq!(
+            db::entry(&conn, zero_id).unwrap().unwrap().category,
+            "居家生活"
+        );
+        assert_eq!(
+            store_rule(&mut conn, rule_input("自如", "居家生活", Kind::Expense)).unwrap()["updated"],
+            0
+        );
+    }
+
+    #[test]
+    fn rule_priority_and_deletion_fallback_are_consistent_for_existing_records() {
+        let db =
+            Database::from_connection(rusqlite::Connection::open_in_memory().unwrap()).unwrap();
+        let mut conn = db.0.lock().unwrap();
+        let mut entry = ledger::sample();
+        entry.split_start = None;
+        entry.split_months = None;
+        entry.merchant = "测试咖啡旗舰店".into();
+        entry.description = "咖啡".into();
+        let id = db::insert(&conn, &entry).unwrap().unwrap();
+        store_rule(&mut conn, rule_input("测试", "宽泛分类", Kind::Expense)).unwrap();
+        store_rule(&mut conn, rule_input("测试咖啡", "具体分类", Kind::Expense)).unwrap();
+        store_rule(&mut conn, rule_input("测试", "修改宽泛分类", Kind::Expense)).unwrap();
+        assert_eq!(db::entry(&conn, id).unwrap().unwrap().category, "具体分类");
+        let specific = rule_id(&conn, "测试咖啡");
+        assert_eq!(delete_rule(&mut conn, specific).unwrap()["updated"], 1);
+        assert_eq!(
+            db::entry(&conn, id).unwrap().unwrap().category,
+            "修改宽泛分类"
+        );
+        let broad = rule_id(&conn, "测试");
+        assert_eq!(delete_rule(&mut conn, broad).unwrap()["updated"], 1);
+        assert_eq!(db::entry(&conn, id).unwrap().unwrap().category, "待分类");
+        assert_eq!(delete_rule(&mut conn, broad).unwrap()["updated"], 0);
+        assert!(load_rules(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn changing_rule_kind_reclassifies_old_and_new_scopes() {
+        let db =
+            Database::from_connection(rusqlite::Connection::open_in_memory().unwrap()).unwrap();
+        let mut conn = db.0.lock().unwrap();
+        let mut entry = ledger::sample();
+        entry.merchant = "MerchantABC".into();
+        entry.split_start = None;
+        entry.split_months = None;
+        let expense = db::insert(&conn, &entry).unwrap().unwrap();
+        entry.kind = Kind::Income;
+        let income = db::insert(&conn, &entry).unwrap().unwrap();
+        store_rule(
+            &mut conn,
+            rule_input("merchant", "旧支出分类", Kind::Expense),
+        )
+        .unwrap();
+        let result = store_rule(&mut conn, rule_input("MERCHANT", "工资", Kind::Income)).unwrap();
+        assert_eq!(result["updated"], 2);
+        assert_eq!(load_rules(&conn).unwrap().len(), 1);
+        assert_eq!(
+            db::entry(&conn, expense).unwrap().unwrap().category,
+            "待分类"
+        );
+        assert_eq!(db::entry(&conn, income).unwrap().unwrap().category, "工资");
+    }
+
+    #[test]
+    fn failed_batch_rolls_back_rule_and_all_classification_changes() {
+        let db =
+            Database::from_connection(rusqlite::Connection::open_in_memory().unwrap()).unwrap();
+        let mut conn = db.0.lock().unwrap();
+        let mut entry = ledger::sample();
+        entry.merchant = "事务测试".into();
+        entry.split_start = None;
+        entry.split_months = None;
+        db::insert(&conn, &entry).unwrap();
+        entry.date = "2026-08-01".into();
+        db::insert(&conn, &entry).unwrap();
+        conn.execute_batch("CREATE TRIGGER reject_classification BEFORE UPDATE ON entries WHEN NEW.date='2026-08-01' BEGIN SELECT RAISE(ABORT,'synthetic-failure'); END;").unwrap();
+        assert!(store_rule(&mut conn, rule_input("事务", "新的分类", Kind::Expense)).is_err());
+        assert!(load_rules(&conn).unwrap().is_empty());
+        assert!(
+            db::entries(&conn)
+                .unwrap()
+                .iter()
+                .all(|e| e.category == entry.category)
+        );
+        conn.execute_batch("DROP TRIGGER reject_classification;")
+            .unwrap();
+        store_rule(&mut conn, rule_input("事务", "新的分类", Kind::Expense)).unwrap();
+        let id = rule_id(&conn, "事务");
+        conn.execute_batch("CREATE TRIGGER reject_delete_batch BEFORE UPDATE ON entries BEGIN SELECT RAISE(ABORT,'synthetic-failure'); END;").unwrap();
+        assert!(delete_rule(&mut conn, id).is_err());
+        assert_eq!(load_rules(&conn).unwrap().len(), 1);
+        assert!(
+            db::entries(&conn)
+                .unwrap()
+                .iter()
+                .all(|e| e.category == "新的分类")
+        );
+    }
 
     #[test]
     fn zero_records_do_not_change_income_averages_or_unclassified_totals() {
