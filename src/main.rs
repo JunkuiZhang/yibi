@@ -24,7 +24,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let command = args.first().map(String::as_str).unwrap_or("serve");
     if matches!(command, "--help" | "-h" | "help") {
         println!(
-            "Tally 拾账\n\n  tally init <用户名> [--password-stdin]  创建或重置私人账户\n  tally serve [--dev]                  启动服务；--dev 仅限本机 HTTP 开发\n  tally backup <目标文件>              创建一致的 SQLite 备份\n\n环境变量：TALLY_DB（默认 data/tally.sqlite3）、TALLY_BIND（默认 127.0.0.1:3080）"
+            "一笔\n\n  tally init <用户名> [--password-stdin]  创建或重置私人账户\n  tally serve [--dev]                  启动服务；--dev 仅限本机 HTTP 开发\n  tally backup <目标文件>              创建一致的 SQLite 备份\n\n环境变量：TALLY_DB（默认 data/tally.sqlite3）、TALLY_BIND（默认 127.0.0.1:3080）"
         );
         return Ok(());
     }
@@ -67,7 +67,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             let listener = tokio::net::TcpListener::bind(bind).await?;
             println!(
-                "拾账已启动：http://{bind}（{}）",
+                "一笔已启动：http://{bind}（{}）",
                 if dev {
                     "本机开发"
                 } else {

@@ -241,7 +241,7 @@ document.addEventListener("click",async event=>{
     }
     if(action==="export"){
       const data=await api("/api/export");const url=URL.createObjectURL(new Blob([JSON.stringify(data,null,2)],{type:"application/json"}));
-      const a=document.createElement("a");a.href=url;a.download=`tally-${today}.json`;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);toast("账本数据已导出");
+      const a=document.createElement("a");a.href=url;a.download=`yibi-${today}.json`;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);toast("账本数据已导出");
     }
     if(action==="logout" || b.id==="logout")await logout();
     if(b.id==="new-entry")openEntry();

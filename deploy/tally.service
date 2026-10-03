@@ -1,5 +1,5 @@
 [Unit]
-Description=Tally personal ledger
+Description=一笔 · Personal ledger
 After=network.target
 
 [Service]

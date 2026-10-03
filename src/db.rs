@@ -33,7 +33,7 @@ impl Database {
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .map_err(|e| e.to_string())?;
         if version > 1 {
-            return Err("数据库版本较新，请使用新版 Tally".into());
+            return Err("数据库版本较新，请使用新版“一笔”".into());
         }
         conn.execute_batch(include_str!("schema.sql"))
             .map_err(|e| e.to_string())?;

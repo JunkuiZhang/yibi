@@ -646,7 +646,7 @@ async fn export(State(state): State<AppState>) -> Result<Response> {
     Ok((
         [(
             header::CONTENT_DISPOSITION,
-            "attachment; filename=\"tally-export.json\"",
+            "attachment; filename=\"yibi-export.json\"",
         )],
         Json(value),
     )
