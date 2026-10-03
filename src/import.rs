@@ -115,7 +115,7 @@ pub fn is_bike_ride(merchant: &str, description: &str) -> bool {
             "头盔",
         ]
         .iter()
-        .any(|word| description.contains(word))
+        .any(|word| text.contains(word))
 }
 
 pub fn parse(filename: &str, bytes: &[u8], rules: &[Rule]) -> Result<Preview, String> {
@@ -517,6 +517,7 @@ mod tests {
         assert!(is_bike_ride("测试出行", "共享单车骑行"));
         for purchase in ["单车月卡", "骑行会员", "骑行卡套餐", "骑行头盔"] {
             assert!(!is_bike_ride("测试出行", purchase));
+            assert!(!is_bike_ride(purchase, ""));
         }
     }
 
