@@ -10,6 +10,7 @@
   <svg class="symbols" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
     <symbol id="i-mark" viewBox="0 0 24 24"><path d="M4 4v16h16M10 4v10h10M16 4v4h4"/></symbol>
     <symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="2"/><rect x="14" y="3" width="7" height="7" rx="2"/><rect x="3" y="14" width="7" height="7" rx="2"/><rect x="14" y="14" width="7" height="7" rx="2"/></symbol>
+    <symbol id="i-bike" viewBox="0 0 24 24"><circle cx="5" cy="16" r="4"/><circle cx="19" cy="16" r="4"/><path d="m5 16 5-9 5 9H5m10 0 3-12h-3M8 7h5m3 3 3 6"/></symbol>
     <symbol id="i-list" viewBox="0 0 24 24"><path d="M9 6h12M9 12h12M9 18h12M3 6h.01M3 12h.01M3 18h.01"/></symbol>
     <symbol id="i-layers" viewBox="0 0 24 24"><path d="m12 3 10 5-10 5L2 8l10-5ZM2 12l10 5 10-5M2 16l10 5 10-5"/></symbol>
     <symbol id="i-upload" viewBox="0 0 24 24"><path d="M12 16V3m-5 5 5-5 5 5M4 15v5a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-5"/></symbol>
@@ -62,6 +63,7 @@
       </section>
       <div id="split-control" class="split-box">
         <label class="check-label"><input name="split" type="checkbox"><span>将这笔支出按月分摊<small>适合会员、保险、房租等跨月费用</small></span></label>
+        <p id="split-zero-note" class="muted small" hidden>零元记录无需分摊；它会完整保留在流水中。</p>
         <div id="split-fields" hidden><div class="form-grid"><label>费用开始月份<input name="split_start" type="month"></label><label>分摊月数<input name="split_months" type="number" value="12" min="2" max="120" step="1"></label></div><p id="split-hint" class="muted small"></p></div>
       </div>
       <label>备注<textarea name="note" rows="2" maxlength="1000" placeholder="留一点想记住的细节（选填）"></textarea></label>

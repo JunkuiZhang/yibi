@@ -12,7 +12,7 @@ const addMonths = (month, count) => { const i=monthIndex(month)+count; return `$
 const kindName = {expense:"支出",income:"收入",transfer:"转账",refund:"退款"};
 const categories = ["餐饮","日用购物","交通出行","居家生活","会员订阅","医疗健康","通讯网络","学习成长","休闲娱乐","兴趣爱好","人情往来","其他支出","待分类"];
 const colors = ["#6e8860","#9bb589","#c2cbb1","#e3d5b5","#b6c9c3","#adb4a2"];
-const state = {tab:"overview",month:today.slice(0,7),mode:"cash",data:null,pool:new Map(),page:1,search:"",kind:"",preview:null,selected:new Set(),previewPage:1,withBonus:true,subscriptionFilter:"all"};
+const state = {tab:"overview",month:today.slice(0,7),mode:"cash",data:null,pool:new Map(),page:1,search:"",kind:"",preview:null,selected:new Set(),previewPage:1,withBonus:true,subscriptionFilter:"all",expandedBikeGroups:new Set()};
 let renderVersion=0,toastTimer,refundSearchTimer,refundSearchVersion=0;
 let editingLinkedRefunds=0;
 try { state.mode=localStorage.getItem("tally-mode")==="allocated" ? "allocated":"cash"; } catch {}
@@ -23,7 +23,7 @@ function toast(message, error=false) {
 }
 function showLogin() {
   renderVersion++;refundSearchVersion++;clearTimeout(refundSearchTimer);$("#app").hidden=true;$("#login-screen").hidden=false;$("#initial-loading").hidden=true;
-  $("#content").replaceChildren();$("#entry-dialog").close();state.pool.clear();state.preview=null;state.selected.clear();state.data=null;
+  $("#content").replaceChildren();$("#entry-dialog").close();state.pool.clear();state.expandedBikeGroups.clear();state.preview=null;state.selected.clear();state.data=null;
   $("#login-form").elements.password.value="";
 }
 async function api(path, options={}) {
@@ -50,7 +50,7 @@ const modeSwitch = () => `<div class="mode-switch" aria-label="统计口径"><bu
 const heading = (title, subtitle, extra="", cls="") => `<div class="page-heading ${cls}"><div>${cls==="greeting"?'<span class="eyebrow">YOUR EVERYDAY, AT A GLANCE</span>':""}<h1>${title}</h1><p>${subtitle}</p></div>${extra}</div>`;
 const empty = (title, text, action="") => `<div class="empty"><span class="empty-icon">${icon("book")}</span><h3>${title}</h3><p>${text}</p>${action?`<div class="empty-actions">${action}</div>`:""}</div>`;
 const addButton = () => `<button class="button primary" data-action="add">${icon("plus")}记一笔</button>`;
-function cacheEntries(rows) {for(const e of rows)state.pool.set(e.id,e);return rows;}
+function cacheEntries(rows) {for(const e of rows){if(e.row_type==="bike_group")cacheEntries(e.entries);else state.pool.set(e.id,e);}return rows;}
 const refundedAmount = e => e.kind==="expense" ? (e.refunded_total_cents ?? e.refunded_cents ?? 0) : 0;
 const netAmount = e => e.net_amount_cents ?? (e.kind==="refund" ? 0 : Math.max(0,e.amount_cents-refundedAmount(e)));
 function allocatedExpense(e, month) {
@@ -63,17 +63,23 @@ function allocatedExpense(e, month) {
 function amountDisplay(e, allocated=false) {
   const refunded=refundedAmount(e),amount=allocated?allocatedExpense(e,state.month):netAmount(e);
   if(e.kind==="refund")return '<span>—</span><small>退款留档</small>';
+  if(e.amount_cents===0)return '<span>¥0.00</span><small>零元记录</small>';
   if(e.kind==="expense" && netAmount(e)===0 && refunded>0)return '<span>—</span><small>已全额退款</small>';
   const sign=e.kind==="transfer"?"":e.kind==="income"?"+":"−";
   return `<span>${sign}${yuan(amount)}</span>${refunded?`<small>已退 ${yuan(refunded)}</small>`:""}`;
 }
+function bikeGroupRow(group) {
+  const filtered=state.tab==="entries" && (state.search || state.kind);
+  return `<tr class="bike-group-row"><td colspan="5"><details class="bike-group" data-bike-month="${esc(group.month)}" ${state.expandedBikeGroups.has(group.month)?"open":""}><summary><span class="transaction-icon bike-icon">${icon("bike")}</span><span class="bike-group-label"><strong>${Number(group.month.slice(5))}月共享单车 · ${group.count}次</strong><small>${filtered?"仅含筛选匹配的零元骑行":"零元骑行按月收起，单笔记录完整保留"}</small></span><span class="amount zero-amount"><span>¥0.00</span><small>零元记录</small></span><span class="bike-group-toggle" aria-hidden="true">${icon("arrow")}</span></summary><div class="bike-group-entries"><p>${monthLabel(group.month)} · ${filtered?"符合筛选的":"本月"} ${group.count} 次零元骑行，按日期从近到远排列。可逐笔编辑或删除。</p>${transactionTable(group.entries)}</div></details></td></tr>`;
+}
 function transactionTable(rows) {
   if(!rows.length)return empty("这个月，故事还没开始", "导入微信、支付宝账单，或手动记下第一笔收支。", `${addButton()}<button class="button secondary" data-tab="import">导入账单</button>`);
   return `<div class="table-scroll"><table class="transaction-table"><thead><tr><th>交易 / 用途</th><th class="desktop-col">分类</th><th class="desktop-col">账户</th><th class="align-right">${state.mode==="allocated"?"本月金额":"计入金额"}</th><th></th></tr></thead><tbody>${rows.map(e=>{
-    const positive=e.kind==="income",fullyRefunded=e.kind==="expense" && netAmount(e)===0 && refundedAmount(e)>0;
+    if(e.row_type==="bike_group")return bikeGroupRow(e);
+    const zero=e.amount_cents===0,positive=e.kind==="income" && !zero,fullyRefunded=e.kind==="expense" && netAmount(e)===0 && refundedAmount(e)>0;
     const symbol={expense:"↓",income:"↑",transfer:"⇄",refund:"↩"}[e.kind];
     const refundNote=e.kind==="refund" ? (e.refund_target?` · 回冲 ${esc(e.refund_target.date.slice(0,7))}`:" · 不单独计收支") : "";
-    return `<tr><td><div class="transaction-name"><span class="transaction-icon ${e.kind}">${symbol}</span><div><strong title="${esc(e.merchant || e.description)}">${esc(e.merchant || e.description || kindName[e.kind])}</strong><small>${esc(e.date)}${e.split_start?` · ${e.split_months} 期分摊`:""}${e.kind==="transfer"?" · 不计收支":""}${refundNote}</small></div></div></td><td class="desktop-col"><span class="tag ${e.category==="待分类" && !fullyRefunded && e.kind!=="refund"?"warn":""}">${esc(e.category)}</span></td><td class="desktop-col">${esc(e.account)}</td><td class="amount ${positive?"positive":""} ${e.kind==="refund" || fullyRefunded?"muted-amount":""}">${amountDisplay(e,state.mode==="allocated")}</td><td><button class="link-button" data-edit="${e.id}" aria-label="编辑 ${esc(e.merchant || e.description)}">编辑</button></td></tr>`;
+    return `<tr><td><div class="transaction-name"><span class="transaction-icon ${zero?"zero-icon":e.kind}">${symbol}</span><div><strong title="${esc(e.merchant || e.description)}">${esc(e.merchant || e.description || kindName[e.kind])}</strong><small>${esc(e.date)}${e.split_start?` · ${e.split_months} 期分摊`:""}${e.kind==="transfer"?" · 不计收支":""}${refundNote}</small></div></div></td><td class="desktop-col"><span class="tag ${e.category==="待分类" && !zero && !fullyRefunded && e.kind!=="refund"?"warn":""}">${esc(e.category)}</span></td><td class="desktop-col">${esc(e.account)}</td><td class="amount ${positive?"positive":""} ${zero?"zero-amount":e.kind==="refund" || fullyRefunded?"muted-amount":""}">${amountDisplay(e,state.mode==="allocated")}</td><td><button class="link-button" data-edit="${e.id}" aria-label="编辑 ${esc(e.merchant || e.description)}">编辑</button></td></tr>`;
   }).join("")}</tbody></table></div>`;
 }
 function statCard(title,value,note,symbol,featured=false) {
@@ -96,7 +102,7 @@ function categoryChart(items) {
 }
 async function overview() {
   const query=new URLSearchParams({month:state.month,mode:state.mode});
-  const [s,list]=await Promise.all([api(`/api/summary?${query}`),api(`/api/entries?${query}`)]);cacheEntries(list.entries);
+  const [s,list]=await Promise.all([api(`/api/summary?${query}`),api(`/api/entries?${query}&group_bikes=true`)]);cacheEntries(list.entries);
   const description=state.mode==="cash"?"按交易月份记净收支，退款抵扣原支出月份。":"将退款后的净支出按月分摊，让每个月更清楚。";
   return heading("把日子，记得清楚。",description,modeSwitch(),"greeting")+
     `<div class="stat-grid">${statCard(state.mode==="cash"?"本月支出":"本月分摊后费用",s.expense,`已抵扣退款 ${yuan(s.refund)}`,"up",true)}${statCard("本月收入",s.income,"工资、奖金与其他实际收入","down")}${statCard(state.mode==="cash"?"本月收支结余":"本月费用口径结余",s.balance,"本月收入 − 本月支出","grid")}${statCard("未来待分摊",s.pending,"已付款，计入后续月份的费用","layers")}</div>`+
@@ -105,11 +111,13 @@ async function overview() {
     `<section class="card card-pad"><div class="card-header"><div><h2>生活的最近几笔</h2><p>${list.total} 笔记录 · ${state.mode==="cash"?"退款回冲原支出月份":"包含净额分摊"}</p></div><button class="button ghost" data-tab="entries">查看全部 ${icon("arrow")}</button></div>${transactionTable(list.entries.slice(0,5))}</section>`;
 }
 async function entriesView() {
-  const query=new URLSearchParams({month:state.month,mode:state.mode,q:state.search,kind:state.kind,page:state.page});
-  const result=await api(`/api/entries?${query}`);cacheEntries(result.entries);
+  const query=new URLSearchParams({month:state.month,mode:state.mode,q:state.search,kind:state.kind,page:state.page,group_bikes:"true"});
+  const result=await api(`/api/entries?${query}`),lastPage=Math.max(1,Math.ceil((result.display_total ?? result.total)/50));
+  if(state.page>lastPage){state.page=lastPage;return entriesView();}
+  cacheEntries(result.entries);
   return heading("每一笔，都有来处。",`${monthLabel(state.month)} · 搜索、分类，也可以补上从前的记录。`,modeSwitch())+
     `<form id="search-form" class="toolbar"><label class="search-box">${icon("search")}<input name="q" value="${esc(state.search)}" aria-label="搜索流水" placeholder="搜索商户、分类、用途或备注"></label><select name="kind" aria-label="筛选收支类型"><option value="">全部类型</option>${Object.entries(kindName).map(([k,v])=>`<option value="${k}" ${state.kind===k?"selected":""}>${v}</option>`).join("")}</select><button class="button secondary" type="submit">筛选</button><button class="button secondary" type="button" data-action="salary">${icon("down")}记工资</button></form>`+
-    `<section class="card card-pad">${transactionTable(result.entries)}<div class="table-footer"><span>共 ${result.total} 笔 · ${state.mode==="cash"?"转账不计入收支":"分摊记录保留原付款日期"}</span>${pagination(state.page,Math.ceil(result.total/50),"page")}</div></section>`;
+    `<section class="card card-pad">${transactionTable(result.entries)}<div class="table-footer"><span>${state.search || state.kind?"筛选匹配":"共"} ${result.total} 笔${result.display_total<result.total?` · 合并展示为 ${result.display_total} 行`:""} · ${state.mode==="cash"?"转账不计入收支":"分摊记录保留原付款日期"}</span>${pagination(state.page,Math.ceil((result.display_total ?? result.total)/50),"page")}</div></section>`;
 }
 function pagination(page,pages,action) {
   return `<div class="pagination"><button data-action="${action}" data-page="${page-1}" ${page<=1?"disabled":""} aria-label="上一页">←</button><span>${page} / ${Math.max(1,pages)}</span><button data-action="${action}" data-page="${page+1}" ${page>=pages?"disabled":""} aria-label="下一页">→</button></div>`;
@@ -136,7 +144,7 @@ function previewView() {
   const p=state.preview.preview, duplicates=p.rows.filter(r=>r.duplicate).length;
   const start=(state.previewPage-1)*100, visible=p.rows.slice(start,start+100);
   return heading("入账之前，再看一眼。",`已识别 ${p.source==="wechat"?"微信":"支付宝"}账单。预览保留 30 分钟；重新上传会替换当前预览。`,'<button class="button secondary" data-action="cancel-import">重新选择文件</button>')+
-    `<div class="preview-summary"><span class="pill">${p.rows.length} 条明细</span><span class="pill">${duplicates} 条重复</span><span class="pill">${p.skipped} 条未完成交易已跳过</span><span class="pill">${p.errors.length} 条无法解析</span></div><section class="card card-pad"><div class="toolbar"><span class="muted small">早于记账起点的记录默认不选，可按需勾选。原付款按退款后净额入账，独立退款留档不计收支。</span><div><button class="link-button" data-action="select-import">全选可导入项</button><button class="link-button" data-action="clear-import">清空选择</button></div></div><div class="table-scroll"><table class="preview-table"><thead><tr><th>选择</th><th>日期 / 交易对象</th><th>类型</th><th>计入金额</th><th>分类</th><th>核对信息</th></tr></thead><tbody>${visible.map((r,i)=>`<tr class="${r.duplicate?"row-duplicate":""}"><td><input type="checkbox" data-import-index="${start+i}" ${state.selected.has(start+i)?"checked":""} ${r.duplicate?"disabled":""} aria-label="导入第 ${r.line} 行"></td><td><div class="transaction-name"><div><strong>${esc(r.entry.merchant || r.entry.description || "交易")}</strong><small>${esc(r.entry.date)}</small></div></div></td><td>${kindName[r.entry.kind]}</td><td class="amount ${r.entry.kind==="income"?"positive":""}">${amountDisplay(r.entry)}</td><td><span class="tag">${esc(r.entry.category)}</span></td><td><div class="preview-warning">${r.duplicate?"重复记录，将跳过":esc(r.warnings.join("；")) || "✓ 可以导入"}</div></td></tr>`).join("")}</tbody></table></div><div class="table-footer"><span>预览第 ${Math.min(start+1,p.rows.length)}–${Math.min(start+100,p.rows.length)} 条</span>${pagination(state.previewPage,Math.ceil(p.rows.length/100),"preview-page")}</div>${p.errors.length?`<details class="errors-list"><summary>${p.errors.length} 条无法解析的行（不会入账）</summary><ul>${p.errors.map(e=>`<li>${esc(e)}</li>`).join("")}</ul></details>`:""}<div class="preview-actions"><span id="selected-count" class="muted">已选择 ${state.selected.size} 条</span><button id="commit-import" class="button primary" data-action="commit-import" ${state.selected.size?"":"disabled"}>确认入账 ${icon("check")}</button></div></section>`;
+    `<div class="preview-summary"><span class="pill">${p.rows.length} 条明细</span><span class="pill">${duplicates} 条重复</span><span class="pill">${p.skipped} 条未完成交易已跳过</span><span class="pill">${p.errors.length} 条无法解析</span></div><section class="card card-pad"><div class="toolbar"><span class="muted small">早于记账起点的记录默认不选，可按需勾选。原付款按退款后净额入账，独立退款留档不计收支。零元记录会保留；零元共享单车入账后按月收起，预览仍逐笔核对。</span><div><button class="link-button" data-action="select-import">全选可导入项</button><button class="link-button" data-action="clear-import">清空选择</button></div></div><div class="table-scroll"><table class="preview-table"><thead><tr><th>选择</th><th>日期 / 交易对象</th><th>类型</th><th>计入金额</th><th>分类</th><th>核对信息</th></tr></thead><tbody>${visible.map((r,i)=>`<tr class="${r.duplicate?"row-duplicate":""}"><td><input type="checkbox" data-import-index="${start+i}" ${state.selected.has(start+i)?"checked":""} ${r.duplicate?"disabled":""} aria-label="导入第 ${r.line} 行"></td><td><div class="transaction-name"><div><strong>${esc(r.entry.merchant || r.entry.description || "交易")}</strong><small>${esc(r.entry.date)}</small></div></div></td><td>${kindName[r.entry.kind]}</td><td class="amount ${r.entry.amount_cents===0?"zero-amount":r.entry.kind==="income"?"positive":""}">${amountDisplay(r.entry)}</td><td><span class="tag">${esc(r.entry.category)}</span></td><td><div class="preview-warning">${r.duplicate?"重复记录，将跳过":esc(r.warnings.join("；")) || "✓ 可以导入"}</div></td></tr>`).join("")}</tbody></table></div><div class="table-footer"><span>预览第 ${Math.min(start+1,p.rows.length)}–${Math.min(start+100,p.rows.length)} 条</span>${pagination(state.previewPage,Math.ceil(p.rows.length/100),"preview-page")}</div>${p.errors.length?`<details class="errors-list"><summary>${p.errors.length} 条无法解析的行（不会入账）</summary><ul>${p.errors.map(e=>`<li>${esc(e)}</li>`).join("")}</ul></details>`:""}<div class="preview-actions"><span id="selected-count" class="muted">已选择 ${state.selected.size} 条</span><button id="commit-import" class="button primary" data-action="commit-import" ${state.selected.size?"":"disabled"}>确认入账 ${icon("check")}</button></div></section>`;
 }
 function settingsView() {
   return heading("一本账本，按你的方式。","调整记账起点、整理分类习惯，或带走自己的数据。")+
@@ -172,9 +180,9 @@ function formKind() {
   splitHint();
 }
 function cents(value, allowZero=false) {
-  const s=String(value).trim();if(!/^\d+(\.\d{1,2})?$/.test(s))throw new Error("金额须为正数，最多两位小数");
+  const s=String(value).trim();if(!/^\d+(\.\d{1,2})?$/.test(s))throw new Error(allowZero?"金额须为零或正数，最多两位小数":"金额须为正数，最多两位小数");
   const [a,b=""]=s.split(".");const n=Number(a)*100+Number(b.padEnd(2,"0"));
-  if(!Number.isSafeInteger(n) || n<(allowZero?0:1) || n>100000000000)throw new Error(allowZero?"已退款金额须为零或正数，且不超过十亿元":"金额必须大于零且不超过十亿元");return n;
+  if(!Number.isSafeInteger(n) || n<(allowZero?0:1) || n>100000000000)throw new Error(allowZero?"金额须为零或正数，且不超过十亿元":"金额必须大于零且不超过十亿元");return n;
 }
 const targetLabel = e => `${e.date} · ${e.merchant || e.description || "支出"} · 原付款 ${yuan(e.amount_cents)}`;
 async function loadRefundTargets() {
@@ -200,13 +208,16 @@ async function loadRefundTargets() {
   }catch(e){if(version===refundSearchVersion)$("#refund-target-hint").textContent=e.message;}
 }
 function splitHint() {
-  const f=$("#entry-form").elements,active=f.split.checked && f.kind.value==="expense";
+  const f=$("#entry-form").elements;
+  let zero=false;try{zero=cents(f.amount.value,true)===0;}catch{}
+  f.split.disabled=zero;if(zero)f.split.checked=false;$("#split-zero-note").hidden=!zero;
+  const active=f.split.checked && f.kind.value==="expense";
   $("#split-fields").hidden=!active;f.split_start.required=active;f.split_months.required=active;
   try {
-    const n=Number(f.split_months.value),original=cents(f.amount.value),confirmed=f.kind.value==="expense"?cents(f.refunded.value || "0",true):0;
+    const n=Number(f.split_months.value),original=cents(f.amount.value,f.kind.value!=="refund"),confirmed=f.kind.value==="expense"?cents(f.refunded.value || "0",true):0;
     const refunded=Math.max(confirmed,editingLinkedRefunds),amount=original-refunded,start=f.split_start.value;
     if(amount<0)throw new Error("累计退款不能超过原始支付金额。");
-    $("#expense-refund-hint").textContent=`${editingLinkedRefunds?`已关联退款 ${yuan(editingLinkedRefunds)}；`:""}${amount===0?"已全额退款，只保留流水。":`计入支出 ${yuan(amount)}${refunded?"，退款回冲原付款月份":""}。`}`;
+    $("#expense-refund-hint").textContent=`${editingLinkedRefunds?`已关联退款 ${yuan(editingLinkedRefunds)}；`:""}${original===0?"零元记录会保留在流水中，不影响收支统计。":amount===0?"已全额退款，只保留流水。":`计入支出 ${yuan(amount)}${refunded?"，退款回冲原付款月份":""}。`}`;
     $("#split-hint").textContent=active && start && n>=2 && n<=120 ? `${monthLabel(start)} 至 ${monthLabel(addMonths(start,n-1))}，共 ${n} 期，每月约 ${yuan(Math.floor(amount/n))}。尾差自动分配，净额总计 ${yuan(amount)}。` : "填写开始月份与期限；实际付款日期保持不变。";
   }catch(e){$("#split-hint").textContent="填写金额后会显示分摊预览。";$("#expense-refund-hint").textContent=f.amount.value?e.message:"原始支付金额保持不变，统计使用退款后的净额。";}
 }
@@ -216,7 +227,7 @@ function openEntry(entry=null, preset="") {
   $("#entry-error").textContent="";$("#entry-title").textContent=entry?"这一笔，记得更清楚":"记下这一笔";
   const base=entry || (preset==="salary" && state.data.last_salary ? {...state.data.last_salary,id:0,date:today}:{});
   f.id.value=entry?.id || "";f.kind.value=base.kind || (preset==="salary"?"income":"expense");
-  f.date.value=base.date || today;f.amount.value=base.amount_cents?(base.amount_cents/100).toFixed(2):"";
+  f.date.value=base.date || today;f.amount.value=base.amount_cents!==undefined?(base.amount_cents/100).toFixed(2):"";
   f.merchant.value=base.merchant || "";f.description.value=base.description || "";f.note.value=base.note || "";
   f.category.value=base.category || (preset==="salary"?"工资":preset==="membership"?"会员订阅":"待分类");
   f.account.value=base.account || (preset==="salary"?"工资卡":"微信");
@@ -231,7 +242,8 @@ async function saveEntry(event) {
   event.preventDefault();const form=event.target,f=form.elements,button=$("button[type=submit]",form);button.disabled=true;$("#entry-error").textContent="";
   try {
     const split=f.kind.value==="expense" && f.split.checked;
-    const entry={date:f.date.value,kind:f.kind.value,amount_cents:cents(f.amount.value),merchant:f.merchant.value.trim(),description:f.description.value.trim(),category:f.category.value.trim(),account:f.account.value.trim(),note:f.note.value.trim(),split_start:split?f.split_start.value:null,split_months:split?Number(f.split_months.value):null,refunded_cents:f.kind.value==="expense"?cents(f.refunded.value || "0",true):0,refund_of:f.kind.value==="refund" && f.refund_of.value?Number(f.refund_of.value):null};
+    const entry={date:f.date.value,kind:f.kind.value,amount_cents:cents(f.amount.value,f.kind.value!=="refund"),merchant:f.merchant.value.trim(),description:f.description.value.trim(),category:f.category.value.trim(),account:f.account.value.trim(),note:f.note.value.trim(),split_start:split?f.split_start.value:null,split_months:split?Number(f.split_months.value):null,refunded_cents:f.kind.value==="expense"?cents(f.refunded.value || "0",true):0,refund_of:f.kind.value==="refund" && f.refund_of.value?Number(f.refund_of.value):null};
+    if(split && entry.amount_cents===0)throw new Error("零元记录无需分摊，请取消分摊设置。");
     if(entry.kind==="expense" && Math.max(entry.refunded_cents,editingLinkedRefunds)>entry.amount_cents)throw new Error("累计退款不能超过原始支付金额。");
     if(f.remember_rule.checked && !entry.merchant)throw new Error("记住分类规则时，请填写交易对象。");
     await api(f.id.value?`/api/entries/${f.id.value}`:"/api/entries",{method:f.id.value?"PUT":"POST",body:entry});
@@ -301,6 +313,11 @@ document.addEventListener("change",event=>{
   const element=event.target;
   if(element.dataset.importIndex!==undefined){const i=Number(element.dataset.importIndex);element.checked?state.selected.add(i):state.selected.delete(i);$("#selected-count").textContent=`已选择 ${state.selected.size} 条`;$("#commit-import").disabled=!state.selected.size;}
 });
+document.addEventListener("toggle",event=>{
+  const group=event.target;
+  if(!group.isConnected || !group.matches?.("details[data-bike-month]"))return;
+  group.open?state.expandedBikeGroups.add(group.dataset.bikeMonth):state.expandedBikeGroups.delete(group.dataset.bikeMonth);
+},true);
 document.addEventListener("submit",async event=>{
   const form=event.target;if(!["search-form","settings-form","rule-form"].includes(form.id))return;
   event.preventDefault();const button=$("button[type=submit],button:not([type])",form);if(button)button.disabled=true;
