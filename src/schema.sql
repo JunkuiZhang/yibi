@@ -1,6 +1,3 @@
-PRAGMA journal_mode = WAL;
-PRAGMA foreign_keys = ON;
-PRAGMA cache_size = -2048;
 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS owner (
     id INTEGER PRIMARY KEY CHECK (id=1),
@@ -12,7 +9,7 @@ CREATE TABLE IF NOT EXISTS entries (
     id INTEGER PRIMARY KEY,
     date TEXT NOT NULL,
     kind TEXT NOT NULL CHECK (kind IN ('expense','income','transfer','refund')),
-    amount_cents INTEGER NOT NULL CHECK(amount_cents>0),
+    amount_cents INTEGER NOT NULL CHECK(amount_cents>=0 AND (kind!='refund' OR amount_cents>0)),
     source TEXT NOT NULL,
     external_id TEXT,
     payload TEXT NOT NULL,
@@ -26,4 +23,3 @@ CREATE TABLE IF NOT EXISTS rules (
     kind TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS previews (token TEXT PRIMARY KEY, created INTEGER NOT NULL, payload TEXT NOT NULL);
-PRAGMA user_version = 1;

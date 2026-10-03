@@ -61,8 +61,11 @@ impl Entry {
         if !valid_date(&self.date) {
             return Err("请输入有效日期（YYYY-MM-DD）".into());
         }
-        if !(1..=MAX_AMOUNT).contains(&self.amount_cents) {
-            return Err("金额必须大于零且不超过十亿元".into());
+        if !(0..=MAX_AMOUNT).contains(&self.amount_cents) {
+            return Err("金额不能小于零或超过十亿元".into());
+        }
+        if self.kind == Kind::Refund && self.amount_cents == 0 {
+            return Err("退款金额必须大于零".into());
         }
         if self.kind == Kind::Expense {
             if !(0..=self.amount_cents).contains(&self.refunded_cents) {
@@ -97,6 +100,9 @@ impl Entry {
             (Some(start), Some(months)) => {
                 if self.kind != Kind::Expense || !(2..=120).contains(&months) {
                     return Err("只有支出可按月分摊，期限为 2–120 个月".into());
+                }
+                if self.amount_cents == 0 {
+                    return Err("零元流水无需按月分摊".into());
                 }
                 month_index(start)?;
                 if add_months(start, months - 1)?.as_str() > "2199-12" {
@@ -209,7 +215,7 @@ pub fn parse_money(value: &str) -> Result<i64, String> {
             .get(1)
             .is_some_and(|s| s.len() > 2 || s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()))
     {
-        return Err("金额须为正数，最多两位小数".into());
+        return Err("金额不能小于零，最多两位小数".into());
     }
     let whole: i64 = parts[0].parse().map_err(|_| "金额过大")?;
     let frac = parts
@@ -220,7 +226,7 @@ pub fn parse_money(value: &str) -> Result<i64, String> {
         .checked_mul(100)
         .and_then(|n| n.checked_add(frac.parse().ok()?))
         .ok_or("金额过大")?;
-    if !(1..=MAX_AMOUNT).contains(&cents) {
+    if !(0..=MAX_AMOUNT).contains(&cents) {
         return Err("金额超出范围".into());
     }
     Ok(cents)
@@ -278,8 +284,9 @@ mod tests {
     fn cents_are_exact_and_invalid_values_rejected() {
         assert_eq!(parse_money("￥1,234.5").unwrap(), 123450);
         assert_eq!(parse_money("0.01").unwrap(), 1);
+        assert_eq!(parse_money("0").unwrap(), 0);
+        assert_eq!(parse_money("￥0.00").unwrap(), 0);
         for s in [
-            "0",
             "-1",
             "1.001",
             "NaN",
@@ -291,6 +298,29 @@ mod tests {
         }
         assert!(!valid_date("2026-02-30"));
         assert!(month_index("2027-13").is_err());
+    }
+
+    #[test]
+    fn zero_amount_records_are_valid_but_cannot_be_refunds_or_memberships() {
+        let mut e = sample();
+        e.amount_cents = 0;
+        assert!(e.validate().unwrap_err().contains("分摊"));
+        e.split_start = None;
+        e.split_months = None;
+        for kind in [Kind::Expense, Kind::Income, Kind::Transfer] {
+            e.kind = kind;
+            e.validate().unwrap();
+            assert_eq!(e.expense_in("2026-10", false), 0);
+            assert_eq!(e.expense_in("2026-10", true), 0);
+        }
+        e.kind = Kind::Expense;
+        e.refunded_cents = 1;
+        assert!(e.validate().unwrap_err().contains("累计退款"));
+        e.refunded_cents = 0;
+        e.kind = Kind::Refund;
+        assert!(e.validate().unwrap_err().contains("退款金额"));
+        e.amount_cents = -1;
+        assert!(e.validate().is_err());
     }
 
     fn refund(id: i64, parent: Option<i64>, date: &str, amount: i64) -> Entry {
