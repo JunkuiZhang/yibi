@@ -35,7 +35,41 @@
     <div class="workspace"><header class="topbar"><div class="breadcrumb">我的账本 <span>/</span> <strong id="page-name">生活概览</strong></div><div class="top-actions"><label class="month-picker"><span class="sr-only">查看月份</span><input id="month" type="month" aria-label="查看月份"></label><button id="new-entry" class="button primary"><svg><use href="#i-plus"/></svg><span>记一笔</span></button></div></header><main id="content" aria-live="polite"></main><footer class="app-footer"><span>一笔 · 让生活有迹可循</span><span id="ledger-since"></span></footer></div>
   </div>
   <div id="initial-loading" class="initial-loading"><span class="brand-mark"><svg><use href="#i-mark"/></svg></span><span>正在打开你的账本…</span></div>
-  <dialog id="entry-dialog"><form id="entry-form"><div class="dialog-header"><div><span class="eyebrow">A MOMENT TO REMEMBER</span><h2 id="entry-title">记下这一笔</h2></div><button type="button" class="icon-button" data-action="close-dialog" aria-label="关闭"><svg><use href="#i-close"/></svg></button></div><input name="id" type="hidden"><div class="form-grid"><label>收支类型<select name="kind"><option value="expense">支出</option><option value="income">收入</option><option value="transfer">账户转账</option><option value="refund">退款</option></select></label><label>金额（元）<input name="amount" inputmode="decimal" autocomplete="off" required placeholder="0.00"></label><label>实际发生日期<input name="date" type="date" required min="1900-01-01" max="2199-12-31"></label><label>账户<input name="account" list="accounts" required maxlength="60" placeholder="微信、支付宝、工资卡…"></label><label>交易对象<input name="merchant" maxlength="200" placeholder="商户或付款人"></label><label>分类<input name="category" list="categories" required maxlength="60" placeholder="选择或输入分类"></label><label class="span-two">商品 / 用途<input name="description" maxlength="500" placeholder="这笔钱用在了哪里？"></label></div><div id="split-control" class="split-box"><label class="check-label"><input name="split" type="checkbox"><span>将这笔支出按月分摊<small>适合会员、保险、房租等跨月费用</small></span></label><div id="split-fields" hidden><div class="form-grid"><label>费用开始月份<input name="split_start" type="month"></label><label>分摊月数<input name="split_months" type="number" value="12" min="2" max="120" step="1"></label></div><p id="split-hint" class="muted small"></p></div></div><label>备注<textarea name="note" rows="2" maxlength="1000" placeholder="留一点想记住的细节（选填）"></textarea></label><label class="check-label rule-check"><input name="remember_rule" type="checkbox"><span>以后包含此交易对象名称的账单，使用相同分类</span></label><p id="entry-error" class="form-error" role="alert"></p><div class="dialog-footer"><button id="delete-entry" type="button" class="button danger ghost" hidden>删除记录</button><span class="spacer"></span><button type="button" class="button secondary" data-action="close-dialog">取消</button><button type="submit" class="button primary">保存记录<svg><use href="#i-check"/></svg></button></div></form></dialog>
+  <dialog id="entry-dialog">
+    <form id="entry-form">
+      <div class="dialog-header"><div><span class="eyebrow">A MOMENT TO REMEMBER</span><h2 id="entry-title">记下这一笔</h2></div><button type="button" class="icon-button" data-action="close-dialog" aria-label="关闭"><svg><use href="#i-close"/></svg></button></div>
+      <input name="id" type="hidden">
+      <div class="form-grid">
+        <label>收支类型<select name="kind"><option value="expense">支出</option><option value="income">收入</option><option value="transfer">账户转账</option><option value="refund">退款</option></select></label>
+        <label>原始交易金额（元）<input name="amount" inputmode="decimal" autocomplete="off" required placeholder="0.00"></label>
+        <label>实际发生日期<input name="date" type="date" required min="1900-01-01" max="2199-12-31"></label>
+        <label>账户<input name="account" list="accounts" required maxlength="60" placeholder="微信、支付宝、工资卡…"></label>
+        <label>交易对象<input name="merchant" maxlength="200" placeholder="商户或付款人"></label>
+        <label>分类<input name="category" list="categories" required maxlength="60" placeholder="选择或输入分类"></label>
+        <label class="span-two">商品 / 用途<input name="description" maxlength="500" placeholder="这笔钱用在了哪里？"></label>
+      </div>
+      <p id="entry-import-status" class="import-status small" hidden></p>
+      <section id="expense-refund-control" class="refund-box">
+        <label>已退款金额（元）<input name="refunded" inputmode="decimal" autocomplete="off" placeholder="0.00" value="0.00" aria-describedby="expense-refund-note expense-refund-hint"></label>
+        <p id="expense-refund-note" class="muted small">填写这笔支出已确认的累计退款。若也关联了退款流水，两者取较大累计额，不重复抵扣。</p>
+        <p id="expense-refund-hint" class="small" aria-live="polite"></p>
+      </section>
+      <section id="refund-control" class="refund-box" hidden>
+        <label>查找原支出<input name="refund_search" type="search" maxlength="200" autocomplete="off" placeholder="搜索商户、用途或交易单号" aria-describedby="refund-target-hint"></label>
+        <label>关联原支出<select name="refund_of"><option value="">不关联，只保留退款流水</option></select></label>
+        <p id="refund-target-hint" class="muted small" aria-live="polite"></p>
+        <p class="muted small">关联后抵扣原支出月份；跨月退款也不会计为当月收入。原支出退款状态已确认时，无需重复关联。保留原始退款金额供核对。</p>
+      </section>
+      <div id="split-control" class="split-box">
+        <label class="check-label"><input name="split" type="checkbox"><span>将这笔支出按月分摊<small>适合会员、保险、房租等跨月费用</small></span></label>
+        <div id="split-fields" hidden><div class="form-grid"><label>费用开始月份<input name="split_start" type="month"></label><label>分摊月数<input name="split_months" type="number" value="12" min="2" max="120" step="1"></label></div><p id="split-hint" class="muted small"></p></div>
+      </div>
+      <label>备注<textarea name="note" rows="2" maxlength="1000" placeholder="留一点想记住的细节（选填）"></textarea></label>
+      <label class="check-label rule-check"><input name="remember_rule" type="checkbox"><span>以后包含此交易对象名称的账单，使用相同分类</span></label>
+      <p id="entry-error" class="form-error" role="alert"></p>
+      <div class="dialog-footer"><button id="delete-entry" type="button" class="button danger ghost" hidden>删除记录</button><span class="spacer"></span><button type="button" class="button secondary" data-action="close-dialog">取消</button><button type="submit" class="button primary">保存记录<svg><use href="#i-check"/></svg></button></div>
+    </form>
+  </dialog>
   <datalist id="accounts"></datalist><datalist id="categories"></datalist><div id="toast" class="toast" role="status" hidden></div>
 </body>
 </html>
