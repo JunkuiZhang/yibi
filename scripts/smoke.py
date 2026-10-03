@@ -36,6 +36,133 @@ def workbook(rows):
     return out.getvalue()
 
 
+def refund_checks(request, preview, template, header):
+    """Check refund attribution through the real HTTP API using synthetic entries."""
+    created = []
+    base = {**template, "split_start":None, "split_months":None,
+            "refunded_cents":0, "refund_of":None}
+
+    def add(**fields):
+        payload = {**base, **fields}
+        identifier = request("/api/entries", payload)["id"]
+        created.append(identifier)
+        return identifier, payload
+
+    def rows(month, mode="cash"):
+        return request(f"/api/entries?month={month}&mode={mode}")["entries"]
+
+    def saved(identifier, month, mode="cash"):
+        return next(e for e in rows(month, mode) if e["id"] == identifier)
+
+    def expense(month, mode="cash"):
+        return request(f"/api/summary?month={month}&mode={mode}")["expense"]
+
+    def remove(identifier):
+        assert request(f"/api/entries/{identifier}", method="DELETE")["deleted"] == 1
+        created.remove(identifier)
+
+    def imported(row):
+        csv = ("微信支付账单明细\n" + ",".join(header) + "\n" + ",".join(row) + "\n").encode()
+        result = preview("refund-fixture.csv", csv)
+        return result, request("/api/import/commit", {"token":result["token"], "indices":[0]})
+
+    try:
+        original, _ = add(date="2029-03-10", amount_cents=10000, merchant="refund-test-payment")
+        first, first_data = add(date="2029-05-01", kind="refund", amount_cents=2500,
+                                merchant="refund-test-payment", refund_of=original)
+        assert expense("2029-03") == 7500
+        may = request("/api/summary?month=2029-05")
+        assert (may["expense"], may["income"]) == (0, 0)
+        payment = saved(original, "2029-03")
+        assert (payment["amount_cents"], payment["refunded_total_cents"], payment["net_amount_cents"]) == (10000, 2500, 7500)
+        refund = saved(first, "2029-05")
+        assert refund["net_amount_cents"] == 0 and refund["refund_target"]["id"] == original
+
+        orphan, _ = add(date="2029-05-02", kind="refund", amount_cents=800,
+                        merchant="refund-test-unlinked")
+        may = request("/api/summary?month=2029-05")
+        assert (may["expense"], may["income"]) == (0, 0)
+        orphan_row = saved(orphan, "2029-05")
+        assert orphan_row["refund_of"] is None and orphan_row["net_amount_cents"] == 0
+
+        second, second_data = add(date="2029-06-01", kind="refund", amount_cents=7500,
+                                  merchant="refund-test-payment", refund_of=original)
+        assert expense("2029-03") == 0 and expense("2029-06") == 0
+        payment = saved(original, "2029-03")
+        assert (payment["amount_cents"], payment["refunded_total_cents"], payment["linked_refunded_cents"], payment["net_amount_cents"]) == (10000, 10000, 10000, 0)
+        request("/api/entries", {**first_data, "refund_of":99999999}, expected=400)
+        request("/api/entries", {**first_data, "refund_of":orphan}, expected=400)
+        request("/api/entries", {**first_data, "date":"2029-03-09"}, expected=400)
+        request("/api/entries", {**first_data, "amount_cents":1}, expected=400)
+        request(f"/api/entries/{second}", {**second_data, "amount_cents":7501}, method="PUT", expected=400)
+        request(f"/api/entries/{original}", method="DELETE", expected=400)
+        request(f"/api/entries/{first}", {**first_data, "refund_of":None}, method="PUT")
+        request(f"/api/entries/{second}", {**second_data, "refund_of":None}, method="PUT")
+        remove(original)
+        assert {first, orphan}.issubset({e["id"] for e in rows("2029-05")})
+
+        membership, _ = add(date="2029-07-10", amount_cents=14800,
+                            refunded_cents=4001, merchant="refund-test-membership",
+                            split_start="2030-02", split_months=12)
+        add(date="2029-08-01", kind="refund", amount_cents=3000,
+            merchant="refund-test-membership", refund_of=membership)
+        member = saved(membership, "2029-07")
+        assert (member["refunded_cents"], member["linked_refunded_cents"], member["refunded_total_cents"], member["net_amount_cents"]) == (4001, 3000, 4001, 10799)
+        assert expense("2029-07") == 10799 and expense("2029-08") == 0
+        allocated = []
+        for i in range(12):
+            index = 2030 * 12 + 1 + i
+            allocated.append(expense(f"{index//12:04}-{index%12+1:02}", "allocated"))
+        assert sum(allocated) == 10799 and max(allocated) - min(allocated) == 1
+        subscriptions = request("/api/subscriptions")["entries"]
+        assert next(e for e in subscriptions if e["id"] == membership)["net_amount_cents"] == 10799
+        add(date="2029-09-01", kind="refund", amount_cents=11800,
+            merchant="refund-test-membership", refund_of=membership)
+        assert expense("2030-04", "allocated") == 0
+        assert saved(membership, "2030-04", "allocated")["net_amount_cents"] == 0
+
+        historical, _ = add(date="2026-01-05", amount_cents=6000,
+                            merchant="refund-test-historical")
+        targets = request("/api/refund-targets?q=refund-test-historical&date=2026-07-15")
+        assert any(e["id"] == historical for e in targets["entries"])
+        assert all(e["id"] != historical for e in request("/api/entries?q=refund-test-historical")["entries"])
+        add(date="2026-07-15", kind="refund", amount_cents=6000,
+            merchant="refund-test-historical", refund_of=historical)
+        assert saved(historical, "2026-01")["net_amount_cents"] == 0
+
+        row = ["2029/10/01 12:00:00", "商户消费", "refund-update-shop", "测试会员",
+               "支出", "148.00", "零钱", "支付成功", "refund-update-wx-1"]
+        _, result = imported(row)
+        assert result == {"inserted":1, "skipped":0, "updated":0}
+        imported_entry = next(e for e in rows("2029-10") if e["merchant"] == "refund-update-shop")
+        imported_id = imported_entry["id"]
+        created.append(imported_id)
+        custom = {**imported_entry, "category":"自定义退款验收", "note":"保留此备注与原分摊期限",
+                  "split_start":"2040-02", "split_months":12}
+        request(f"/api/entries/{imported_id}", custom, method="PUT")
+        original_count = len(request("/api/export")["entries"])
+        row[7] = "已退款(¥48.01)"
+        p, result = imported(row)
+        assert not p["preview"]["rows"][0]["duplicate"]
+        assert result == {"inserted":0, "skipped":0, "updated":1}
+        changed = saved(imported_id, "2029-10")
+        assert (changed["refunded_cents"], changed["net_amount_cents"], changed["import_status"]) == (4801, 9999, row[7])
+        for field in ("category", "note", "split_start", "split_months"):
+            assert changed[field] == custom[field], field
+        assert len(request("/api/export")["entries"]) == original_count
+        _, result = imported(row)
+        assert result == {"inserted":0, "skipped":1, "updated":0}
+        row[7] = "已全额退款"
+        _, result = imported(row)
+        assert result == {"inserted":0, "skipped":0, "updated":1}
+        assert saved(imported_id, "2040-04", "allocated")["net_amount_cents"] == 0
+    finally:
+        # Refunds are created after their parents, so reversing creation order keeps
+        # referential protections intact and restores the nine baseline fixtures.
+        for identifier in reversed(created.copy()):
+            remove(identifier)
+
+
 def main():
     assert BIN.exists(), "Build the executable with cargo build first"
     with tempfile.TemporaryDirectory(prefix="tally-smoke-") as directory:
@@ -117,10 +244,11 @@ def main():
             p = preview("wechat.csv", csv)
             assert p["preview"]["rows"][1]["duplicate"]
             result = request("/api/import/commit", {"token":p["token"], "indices":[0,1]})
-            assert result == {"inserted":1,"skipped":1}
+            assert result == {"inserted":1,"skipped":1,"updated":0}
             p = preview("wechat.csv", csv)
             assert all(r["duplicate"] for r in p["preview"]["rows"])
             row[-1] = "test-xlsx-2"
+            row[0] = "2026/07/01 12:00:00"
             p = preview("wechat.xlsx", workbook([header, row]))
             assert p["preview"]["rows"][0]["entry"]["amount_cents"] == 1850
             request("/api/import/commit", {"token":p["token"], "indices":[0]})
@@ -133,6 +261,7 @@ def main():
             p = preview("alipay.csv", ali)
             assert p["preview"]["rows"][0]["entry"]["category"] == "日常补给"
             request(f"/api/entries/{membership}", {**template, "note":"修改备注不会重复扣款"}, method="PUT")
+            refund_checks(request, preview, template, header)
             exported = request("/api/export")
             assert len(exported["entries"]) == 9 and "password_hash" not in json.dumps(exported)
             backup = Path(directory) / "backup.sqlite3"
@@ -144,7 +273,7 @@ def main():
             request("/api/export", expected=401)
             status = Path(f"/proc/{process.pid}/status").read_text()
             memory = [line for line in status.splitlines() if line.startswith(("VmRSS:", "VmHWM:"))]
-            print(json.dumps({"status":"passed", "http_checks":checks, "xlsx":"passed", "backup":"passed", "memory":memory}, ensure_ascii=False))
+            print(json.dumps({"status":"passed", "http_checks":checks, "xlsx":"passed", "refunds":"passed", "backup":"passed", "memory":memory}, ensure_ascii=False))
         finally:
             process.terminate()
             try:
