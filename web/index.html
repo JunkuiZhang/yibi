@@ -67,7 +67,7 @@
         <div id="split-fields" hidden><div class="form-grid"><label>费用开始月份<input name="split_start" type="month"></label><label>分摊月数<input name="split_months" type="number" value="12" min="2" max="120" step="1"></label></div><p id="split-hint" class="muted small"></p></div>
       </div>
       <label>备注<textarea name="note" rows="2" maxlength="1000" placeholder="留一点想记住的细节（选填）"></textarea></label>
-      <label class="check-label rule-check"><input name="remember_rule" type="checkbox"><span>以后包含此交易对象名称的账单，使用相同分类</span></label>
+      <label class="check-label rule-check"><input name="remember_rule" type="checkbox"><span>将此商户的同类型账单统一分类，并用于后续导入</span></label>
       <p id="entry-error" class="form-error" role="alert"></p>
       <div class="dialog-footer"><button id="delete-entry" type="button" class="button danger ghost" hidden>删除记录</button><span class="spacer"></span><button type="button" class="button secondary" data-action="close-dialog">取消</button><button type="submit" class="button primary">保存记录<svg><use href="#i-check"/></svg></button></div>
     </form>
