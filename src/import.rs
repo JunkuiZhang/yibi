@@ -2,7 +2,7 @@ use crate::{
     auth::digest,
     ledger::{Entry, Kind, parse_money, valid_date},
 };
-use calamine::{Reader, Xlsx};
+use calamine::{Data, Reader, Xlsx};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet},
@@ -126,7 +126,7 @@ pub fn parse(filename: &str, bytes: &[u8], rules: &[Rule]) -> Result<Preview, St
         }
         sheet
             .rows()
-            .map(|r| r.iter().map(|c| c.to_string()).collect())
+            .map(|r| r.iter().map(spreadsheet_cell).collect())
             .collect()
     } else if lower.ends_with(".csv") {
         let text = match std::str::from_utf8(bytes) {
@@ -156,6 +156,23 @@ pub fn parse(filename: &str, bytes: &[u8], rules: &[Rule]) -> Result<Preview, St
         return Err("支持 CSV 和 XLSX；ZIP 下载包请先在本地解压".into());
     };
     parse_table(table, rules)
+}
+
+fn spreadsheet_cell(cell: &Data) -> String {
+    match cell {
+        // WeChat XLSX exports use styled Excel serial numbers for transaction
+        // times. Display would return the serial rather than a calendar date.
+        Data::DateTime(value)
+            if value.is_datetime()
+                && value.as_f64().is_finite()
+                && (0.0..200_000.0).contains(&value.as_f64()) =>
+        {
+            let (year, month, day, hour, minute, second, _) = value.to_ymd_hms_milli();
+            format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}")
+        }
+        Data::DateTimeIso(value) => value.replace('T', " "),
+        _ => cell.to_string(),
+    }
 }
 
 fn check_sheet_bounds(bytes: &[u8]) -> Result<(), String> {
@@ -387,6 +404,91 @@ fn clean(s: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+
+    fn dated_workbook(date_1904: bool) -> Vec<u8> {
+        let epoch = if date_1904 {
+            (1904, 1, 1)
+        } else {
+            (1899, 12, 30)
+        };
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 7, 1).unwrap();
+        let epoch = chrono::NaiveDate::from_ymd_opt(epoch.0, epoch.1, epoch.2).unwrap();
+        let serial = date.signed_duration_since(epoch).num_days() as f64 + 0.5;
+        let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default();
+        let strings = [
+            "微信支付账单明细",
+            "交易时间",
+            "交易类型",
+            "交易对方",
+            "商品",
+            "收/支",
+            "金额(元)",
+            "支付方式",
+            "当前状态",
+            "交易单号",
+            "商户单号",
+            "备注",
+            "商户消费",
+            "合成测试商户",
+            "合成商品",
+            "支出",
+            "零钱",
+            "支付成功",
+            "synthetic-order",
+        ];
+        let shared = strings
+            .iter()
+            .map(|s| format!("<si><t>{s}</t></si>"))
+            .collect::<String>();
+        let header = (0..11)
+            .map(|i| {
+                format!(
+                    "<c r=\"{}18\" t=\"s\"><v>{}</v></c>",
+                    char::from(b'A' + i),
+                    i + 1
+                )
+            })
+            .collect::<String>();
+        let files = [
+            ("[Content_Types].xml", r#"<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/></Types>"#.to_owned()),
+            ("_rels/.rels", r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#.to_owned()),
+            ("xl/workbook.xml", format!(r#"<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><workbookPr date1904="{}"/><sheets><sheet name="账单" sheetId="1" r:id="rId1"/></sheets></workbook>"#, u8::from(date_1904))),
+            ("xl/_rels/workbook.xml.rels", r#"<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/><Relationship Id="rId3" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="sharedStrings.xml"/></Relationships>"#.to_owned()),
+            ("xl/styles.xml", r#"<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><numFmts count="2"><numFmt numFmtId="164" formatCode="yyyy-mm-dd hh:mm:ss"/><numFmt numFmtId="165" formatCode="¥#,##0.00"/></numFmts><cellXfs count="3"><xf numFmtId="0"/><xf numFmtId="164"/><xf numFmtId="165"/></cellXfs></styleSheet>"#.to_owned()),
+            ("xl/sharedStrings.xml", format!(r#"<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">{shared}</sst>"#)),
+            ("xl/worksheets/sheet1.xml", format!(r#"<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><dimension ref="A1:K19"/><sheetData><row r="1"><c r="A1" t="s"><v>0</v></c></row><row r="18">{header}</row><row r="19"><c r="A19" s="1"><v>{serial}</v></c><c r="B19" t="s"><v>12</v></c><c r="C19" t="s"><v>13</v></c><c r="D19" t="s"><v>14</v></c><c r="E19" t="s"><v>15</v></c><c r="F19" s="2"><v>148.00</v></c><c r="G19" t="s"><v>16</v></c><c r="H19" t="s"><v>17</v></c><c r="I19" t="s"><v>18</v></c></row></sheetData></worksheet>"#)),
+        ];
+        for (name, contents) in files {
+            zip.start_file(name, options).unwrap();
+            zip.write_all(contents.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap().into_inner()
+    }
+
+    #[test]
+    fn wechat_xlsx_numeric_dates_with_styles_and_shared_strings() {
+        for epoch_1904 in [false, true] {
+            let preview = parse("wechat.xlsx", &dated_workbook(epoch_1904), &[]).unwrap();
+            assert!(preview.errors.is_empty(), "{:?}", preview.errors);
+            assert_eq!(preview.rows.len(), 1);
+            let row = &preview.rows[0];
+            assert_eq!(row.line, 19);
+            assert_eq!(row.entry.date, "2026-07-01");
+            assert_eq!(row.entry.amount_cents, 14800);
+            assert_eq!(
+                row.entry.external_id.as_deref(),
+                Some("synthetic-order:expense")
+            );
+        }
+        assert_eq!(
+            spreadsheet_cell(&Data::DateTimeIso("2026-07-01T12:00:00".into())),
+            "2026-07-01 12:00:00"
+        );
+        assert_eq!(spreadsheet_cell(&Data::Float(148.0)), "148");
+    }
+
     #[test]
     fn oversized_sparse_sheet_rejected_before_range_allocation() {
         assert!(
