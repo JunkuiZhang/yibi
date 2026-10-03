@@ -9,3 +9,5 @@
 *.db-*
 /imports/
 /backups/
+__pycache__/
+*.pyc

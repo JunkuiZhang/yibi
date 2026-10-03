@@ -6,7 +6,7 @@
 
 仓库提供 systemd、Nginx 和 Caddy 示例。只选择与服务器现有环境一致的反向代理。当前尚未连接或修改阿里云服务器；真实域名、证书位置和端口占用需要部署时确认。
 
-已确认的目标服务器：Ubuntu 22.04.5 LTS、x86_64、Nginx 1.18.0（Ubuntu）、Certbot 1.21.0。实际域名尚未确定，文中的示例域名必须替换。
+已确认的目标服务器：Ubuntu 22.04.5 LTS、x86_64、Nginx 1.18.0（Ubuntu）、Certbot 1.21.0。实际域名为 `yibi.example.com`；首次部署章节仍使用示例域名，须替换为实际域名。
 
 ## 1. 构建
 
@@ -30,7 +30,7 @@ TALLY_TEST_BINARY=target/x86_64-unknown-linux-musl/release/tally python3 scripts
 
 产物为 `target/x86_64-unknown-linux-musl/release/tally`。发布包只需包含该文件、`deploy/`、本部署说明和校验和；不要上传本地演示数据库或账户文件。在服务器解压后先运行 `sha256sum -c SHA256SUMS` 和 `./tally --help`，再安装。
 
-当前 musl 产物已在开发机完成 40 项真实 HTTP 检查（含 XLSX 和数据库备份），并确认是没有动态加载器或共享库依赖的 static PIE。尚未在目标服务器执行；上传后仍需完成启动和 HTTPS 验收。
+当前 0.2 musl 产物已在开发机完成 112 项真实 HTTP 检查（含 XLSX、退款和数据库备份），并确认是没有动态加载器或共享库依赖的 static PIE。尚未在目标服务器执行；上传后仍需完成启动和 HTTPS 验收。
 
 ## 2. 初始化目录和账户
 
@@ -122,10 +122,49 @@ sudo -u tally env TALLY_DB=/var/lib/tally/tally.sqlite3 \
 
 首次部署后应执行一次备份恢复演练，并确认金额、分摊计划和规则均完整。仓库中的 HTTP 冒烟测试已经验证在线备份的 SQLite 完整性与记录数量。
 
+## 6. 从 0.1 更新到 0.2（已有 Nginx/账户/账本）
+
+0.2 修复微信 XLSX 的 Excel 数字日期解析，并将退款改为回冲原支出月份。新增字段兼容已有数据库，更新时无需运行 `init`，也无需改 Nginx 或重新申请证书。旧流水缺少退款状态时，可重新导入原账单，确认预览中的累计退款更新。
+
+将新包 `yibi-linux-x86_64-0.2.0.tar.gz` 上传到服务器 `/root/yibi/`。以下命令按当前 root 登录执行，每组成功后再执行下一组：
+
+```sh
+cd /root/yibi
+tar -xzf yibi-linux-x86_64-0.2.0.tar.gz
+cd yibi-linux-x86_64-0.2.0
+sha256sum -c SHA256SUMS
+./tally --help
+```
+
+先在线备份到新文件；时间戳同时用于旧程序备份。在同一终端继续执行：
+
+```sh
+YIBI_UPDATE_ID=$(date +%Y%m%d-%H%M%S)
+install -d -o tally -g tally -m 0700 /var/lib/tally/backups
+sudo -u tally env TALLY_DB=/var/lib/tally/tally.sqlite3 \
+  /opt/tally/tally backup "/var/lib/tally/backups/before-0.2-${YIBI_UPDATE_ID}.sqlite3"
+```
+
+备份成功后，停止这一笔服务，保存旧程序并替换为新程序：
+
+```sh
+systemctl stop tally
+cp -p /opt/tally/tally "/opt/tally/tally.before-${YIBI_UPDATE_ID}"
+install -m 0755 ./tally /opt/tally/tally
+systemctl start tally
+systemctl status tally --no-pager
+curl --fail http://127.0.0.1:3080/health
+curl --fail https://yibi.example.com/health
+```
+
+若启动失败，先执行 `journalctl -u tally -n 50 --no-pager` 查看原因。需要回退程序时先停止服务，将本次保存的旧程序恢复至 `/opt/tally/tally` 再启动；若新版本已经写入退款信息，旧版不会理解新退款字段，应配合上述备份恢复流程回退数据。
+
+更新后刷新浏览器，再导入原微信账单。全额退款支出和退款行显示留档标识，部分退款按净额展示。独立退款没有可靠关联号时不会猜测原支出，可在编辑中手动选择；原支出已含明确退款状态时不必重复关联。
+
 ## 当前边界
 
 - 支持 CNY 自然月分摊，不支持按天折算、多币种或多人共享。
 - 导入器已验证典型 CSV/GBK/XLSX 格式；平台改版后的导出字段需要结合真实样本再确认。
-- 原付款“已退款”的文字状态不足以确认具体退款金额，导入时会提醒核对；退款抵扣到账月份，不自动撤销原会员计划。
+- 原付款明确标注“已全额退款”或累计退款金额时自动抵扣原支出；其他退款状态提醒核对。独立退款仅留档，可手动关联，跨月仍回冲原支出月份；原会员按净额重新分摊，期限不变。
 - 账本结余是期间收支差额，不等于银行余额；没有期初余额或银行卡自动同步。
 - 分类使用本地规则，不调用第三方 AI 或发送账单内容到其他服务。
