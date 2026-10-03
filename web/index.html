@@ -46,7 +46,7 @@
         <label>实际发生日期<input name="date" type="date" required min="1900-01-01" max="2199-12-31"></label>
         <label>账户<input name="account" list="accounts" required maxlength="60" placeholder="微信、支付宝、工资卡…"></label>
         <label>交易对象<input name="merchant" maxlength="200" placeholder="商户或付款人"></label>
-        <label>分类<input name="category" list="categories" required maxlength="60" placeholder="选择或输入分类"></label>
+        <div class="category-field"><label for="entry-category">分类</label><div id="category-picker" class="category-picker"><input id="entry-category" name="category" required maxlength="60" autocomplete="off" placeholder="选择或输入分类" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="category-options" aria-haspopup="listbox"><button id="category-toggle" type="button" aria-label="展开分类列表" aria-controls="category-options" aria-expanded="false"><svg aria-hidden="true"><use href="#i-arrow"/></svg></button><div id="category-options" class="category-options" role="listbox" aria-label="分类选项" hidden></div></div></div>
         <label class="span-two">商品 / 用途<input name="description" maxlength="500" placeholder="这笔钱用在了哪里？"></label>
       </div>
       <p id="entry-import-status" class="import-status small" hidden></p>

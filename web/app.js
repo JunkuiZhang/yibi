@@ -168,6 +168,28 @@ async function render() {
 }
 async function refresh(){await bootstrap();await render();}
 function changeTab(tab){state.tab=tab;state.page=1;render();}
+let categorySuggestions=[],activeCategory=-1;
+function categoryChoices() {
+  const kind=$("#entry-form").elements.kind.value;
+  const defaults=kind==="income"?["工资","年终奖","利息","其他收入","待分类"]:kind==="transfer"?["账户转账"]:categories;
+  const saved=[...state.pool.values()].filter(e=>e.kind===kind).map(e=>e.category);
+  const rules=(state.data?.rules || []).filter(r=>r.kind===kind).map(r=>r.category);
+  return [...new Set([...defaults,...saved,...rules].filter(Boolean))];
+}
+function closeCategories() {
+  $("#category-options").hidden=true;$("#entry-category").setAttribute("aria-expanded","false");
+  $("#category-toggle").setAttribute("aria-expanded","false");$("#entry-category").removeAttribute("aria-activedescendant");activeCategory=-1;
+}
+function openCategories(filter="") {
+  const input=$("#entry-category"),list=$("#category-options");
+  categorySuggestions=categoryChoices().filter(name=>name.toLowerCase().includes(filter.trim().toLowerCase()));activeCategory=-1;
+  list.innerHTML=categorySuggestions.length?categorySuggestions.map((name,i)=>`<button type="button" role="option" id="category-option-${i}" data-category-index="${i}" tabindex="-1" aria-selected="${name===input.value}">${esc(name)}</button>`).join(""):'<p class="category-empty">没有匹配项，可直接输入新分类。</p>';
+  list.hidden=false;list.scrollTop=0;input.setAttribute("aria-expanded","true");input.removeAttribute("aria-activedescendant");$("#category-toggle").setAttribute("aria-expanded","true");
+}
+function chooseCategory(index) {
+  if(categorySuggestions[index]===undefined)return;
+  const input=$("#entry-category");input.value=categorySuggestions[index];input.focus();closeCategories();input.dispatchEvent(new Event("change",{bubbles:true}));
+}
 function formKind() {
   const form=$("#entry-form"),kind=form.elements.kind.value;
   $("#split-control").hidden=kind!=="expense";
@@ -175,6 +197,7 @@ function formKind() {
   $("#refund-control").hidden=kind!=="refund";
   const choices=kind==="income"?["工资","年终奖","利息","其他收入","待分类"]:kind==="transfer"?["账户转账"]:categories;
   $("#categories").innerHTML=choices.map(c=>`<option value="${esc(c)}">`).join("");
+  closeCategories();
   if(kind==="refund")loadRefundTargets();
   else {refundSearchVersion++;clearTimeout(refundSearchTimer);}
   splitHint();
@@ -334,6 +357,29 @@ $("#login-form").addEventListener("submit",async event=>{
 });
 $("#month").addEventListener("change",async event=>{if(event.target.value && event.target.validity.valid){state.month=event.target.value;state.page=1;await render();}});
 $("#entry-form").addEventListener("submit",saveEntry);
+$("#entry-category").addEventListener("focus",()=>openCategories());
+$("#entry-category").addEventListener("input",event=>openCategories(event.target.value));
+$("#category-toggle").addEventListener("click",()=>{
+  if(!$("#category-options").hidden){closeCategories();return;}
+  $("#entry-category").focus();openCategories();
+});
+$("#category-options").addEventListener("pointerdown",event=>event.preventDefault());
+$("#category-options").addEventListener("click",event=>{
+  const option=event.target.closest("[data-category-index]");if(option)chooseCategory(Number(option.dataset.categoryIndex));
+});
+$("#entry-category").addEventListener("keydown",event=>{
+  if(event.isComposing)return;
+  const open=!$("#category-options").hidden;
+  if(event.key==="Escape" && open){event.preventDefault();event.stopPropagation();closeCategories();return;}
+  if(event.key==="Tab"){closeCategories();return;}
+  if(event.key==="Enter" && open){event.preventDefault();if(activeCategory>=0)chooseCategory(activeCategory);else closeCategories();return;}
+  if(event.key!=="ArrowDown" && event.key!=="ArrowUp")return;
+  event.preventDefault();if(!open)openCategories();if(!categorySuggestions.length)return;
+  activeCategory=activeCategory<0?(event.key==="ArrowDown"?0:categorySuggestions.length-1):(activeCategory+(event.key==="ArrowDown"?1:-1)+categorySuggestions.length)%categorySuggestions.length;
+  const options=$("#category-options").querySelectorAll("[role=option]");options.forEach((option,i)=>option.classList.toggle("active",i===activeCategory));
+  const option=options[activeCategory];$("#entry-category").setAttribute("aria-activedescendant",option.id);option.scrollIntoView({block:"nearest"});
+});
+document.addEventListener("pointerdown",event=>{if(!$("#category-picker").contains(event.target))closeCategories();});
 $("#entry-form").elements.kind.addEventListener("change",formKind);
 $("#entry-form").addEventListener("input",splitHint);
 $("#entry-form").elements.split.addEventListener("change",splitHint);
@@ -345,6 +391,6 @@ $("#entry-form").elements.refund_of.addEventListener("change",()=>{
   refundSearchVersion++;clearTimeout(refundSearchTimer);
   $("#refund-target-hint").textContent=$("#entry-form").elements.refund_of.value?"已选择原支出，保存后将回冲该笔支出。":"仅留存退款流水。若原支出尚未确认退款，可关联原支出或编辑其已退款金额。";
 });
-$("#entry-dialog").addEventListener("close",()=>{refundSearchVersion++;clearTimeout(refundSearchTimer);});
+$("#entry-dialog").addEventListener("close",()=>{refundSearchVersion++;clearTimeout(refundSearchTimer);closeCategories();});
 $("#categories").innerHTML=categories.map(c=>`<option value="${esc(c)}">`).join("");
 (async()=>{try{await bootstrap();await render();}catch(e){showLogin();if(e.message!=="请先登录")$("#login-error").textContent=e.message;}})();
