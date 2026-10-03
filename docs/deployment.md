@@ -122,44 +122,42 @@ sudo -u tally env TALLY_DB=/var/lib/tally/tally.sqlite3 \
 
 首次部署后应执行一次备份恢复演练，并确认金额、分摊计划和规则均完整。仓库中的 HTTP 冒烟测试已经验证在线备份的 SQLite 完整性与记录数量。
 
-## 6. 从 0.1 更新到 0.2（已有 Nginx/账户/账本）
+## 6. 从 0.1 / 0.2 更新到 0.3（已有 Nginx/账户/账本）
 
-0.2 修复微信 XLSX 的 Excel 数字日期解析，并将退款改为回冲原支出月份。新增字段兼容已有数据库，更新时无需运行 `init`，也无需改 Nginx 或重新申请证书。旧流水缺少退款状态时，可重新导入原账单，确认预览中的累计退款更新。
+0.3 支持支付宝零元交易，并把共享单车的零元骑行按月收起为次数汇总，展开后保留单笔编辑。也包含 0.2 的微信 XLSX 日期修复与退款回冲。更新时自动将数据库结构从 v1 升级到 v2，保留账户、流水、分摊、退款关联和规则。无需运行 `init`，无需改 Nginx 或重新申请证书。
 
-将新包 `yibi-linux-x86_64-0.2.0.tar.gz` 上传到服务器 `/root/yibi/`。以下命令按当前 root 登录执行，每组成功后再执行下一组：
+将新包 `yibi-linux-x86_64-0.3.0.tar.gz` 上传到服务器 `/root/yibi/`。以下按当前 root 登录执行；先解包并核验：
 
 ```sh
 cd /root/yibi
-tar -xzf yibi-linux-x86_64-0.2.0.tar.gz
-cd yibi-linux-x86_64-0.2.0
+tar -xzf yibi-linux-x86_64-0.3.0.tar.gz
+cd yibi-linux-x86_64-0.3.0
 sha256sum -c SHA256SUMS
 ./tally --help
 ```
 
-先在线备份到新文件；时间戳同时用于旧程序备份。在同一终端继续执行：
+核验成功后，在上述目录执行下面整个代码块。它只停止一笔服务，用当前安装的旧程序备份升级前数据库，再替换程序；任一步失败就停止执行，先检查错误再继续。
 
 ```sh
-YIBI_UPDATE_ID=$(date +%Y%m%d-%H%M%S)
-install -d -o tally -g tally -m 0700 /var/lib/tally/backups
-sudo -u tally env TALLY_DB=/var/lib/tally/tally.sqlite3 \
-  /opt/tally/tally backup "/var/lib/tally/backups/before-0.2-${YIBI_UPDATE_ID}.sqlite3"
+(
+  set -eu
+  YIBI_UPDATE_ID=$(date +%Y%m%d-%H%M%S)
+  install -d -o tally -g tally -m 0700 /var/lib/tally/backups
+  systemctl stop tally
+  sudo -u tally env TALLY_DB=/var/lib/tally/tally.sqlite3 \
+    /opt/tally/tally backup "/var/lib/tally/backups/before-0.3-${YIBI_UPDATE_ID}.sqlite3"
+  cp -p /opt/tally/tally "/opt/tally/tally.before-${YIBI_UPDATE_ID}"
+  install -m 0755 ./tally /opt/tally/tally
+  systemctl start tally
+  systemctl status tally --no-pager
+  curl --fail http://127.0.0.1:3080/health
+  curl --fail https://yibi.example.com/health
+)
 ```
 
-备份成功后，停止这一笔服务，保存旧程序并替换为新程序：
+若启动失败，执行 `journalctl -u tally -n 50 --no-pager` 查看原因。**旧程序不能打开升级后的 v2 数据库**；回退时须停止服务，同时恢复本次保存的旧程序与 `before-0.3-…sqlite3` 备份。按上一节“备份与恢复”将当前主库及 `-wal`、`-shm` 移到保留目录后再恢复，避免混用。回退数据会撤销升级后的新增记录和修改。
 
-```sh
-systemctl stop tally
-cp -p /opt/tally/tally "/opt/tally/tally.before-${YIBI_UPDATE_ID}"
-install -m 0755 ./tally /opt/tally/tally
-systemctl start tally
-systemctl status tally --no-pager
-curl --fail http://127.0.0.1:3080/health
-curl --fail https://yibi.example.com/health
-```
-
-若启动失败，先执行 `journalctl -u tally -n 50 --no-pager` 查看原因。需要回退程序时先停止服务，将本次保存的旧程序恢复至 `/opt/tally/tally` 再启动；若新版本已经写入退款信息，旧版不会理解新退款字段，应配合上述备份恢复流程回退数据。
-
-更新后刷新浏览器，再导入原微信账单。全额退款支出和退款行显示留档标识，部分退款按净额展示。独立退款没有可靠关联号时不会猜测原支出，可在编辑中手动选择；原支出已含明确退款状态时不必重复关联。
+更新后刷新浏览器，再导入支付宝原账单。如果旧版已导入 22 笔非零记录，新版会跳过它们并补入 118 笔零元记录；整份再次导入不会增加流水或骑行次数。每个月的零元共享单车合并显示，付费骑行和骑行卡费用独立显示。
 
 ## 当前边界
 
