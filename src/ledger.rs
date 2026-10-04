@@ -42,6 +42,8 @@ pub struct Entry {
     #[serde(default)]
     pub description: String,
     pub category: String,
+    #[serde(default)]
+    pub category_locked: bool,
     pub account: String,
     #[serde(default)]
     pub note: String,
@@ -235,6 +237,7 @@ pub fn parse_money(value: &str) -> Result<i64, String> {
 #[cfg(test)]
 pub(crate) fn sample() -> Entry {
     Entry {
+        category_locked: false,
         id: 0,
         date: "2026-10-04".into(),
         kind: Kind::Expense,

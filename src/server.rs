@@ -65,6 +65,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/state", get(bootstrap))
         .route("/api/logout", post(logout))
         .route("/api/entries", get(list_entries).post(create_entry))
+        .route("/api/entries/categories", post(batch_categories))
+        .route("/api/classification", get(classification))
         .route("/api/refund-targets", get(refund_targets))
         .route(
             "/api/entries/{id}",
@@ -241,18 +243,25 @@ async fn logout(State(state): State<AppState>, headers: HeaderMap) -> Result<Res
 
 fn load_rules(c: &rusqlite::Connection) -> db::DbResult<Vec<Rule>> {
     let mut stmt = c
-        .prepare("SELECT id,pattern,category,kind FROM rules ORDER BY length(pattern) DESC,id DESC")
+        .prepare("SELECT id,pattern,category,kind,description_pattern FROM rules ORDER BY (length(description_pattern)>0) DESC,length(pattern)+length(description_pattern) DESC,id DESC")
         .map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map([], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get::<_, String>(3)?))
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get::<_, String>(3)?,
+                r.get(4)?,
+            ))
         })
         .map_err(|e| e.to_string())?;
     rows.map(|r| {
-        let (id, pattern, category, kind) = r.map_err(|e| e.to_string())?;
+        let (id, pattern, category, kind, description_pattern) = r.map_err(|e| e.to_string())?;
         Ok(Rule {
             id,
             pattern,
+            description_pattern,
             category,
             kind: serde_json::from_value(json!(kind)).map_err(|e| e.to_string())?,
         })
@@ -469,6 +478,98 @@ async fn remove_entry(State(state): State<AppState>, Path(id): Path<i64>) -> Res
 }
 
 #[derive(Deserialize)]
+struct CategoryBatch {
+    ids: Vec<i64>,
+    category: String,
+    #[serde(default = "fixed_category")]
+    category_locked: bool,
+}
+
+#[derive(Default, Deserialize)]
+struct ClassificationQuery {
+    q: Option<String>,
+    merchant: Option<String>,
+    kind: Option<Kind>,
+    pending: Option<bool>,
+    page: Option<usize>,
+}
+
+async fn classification(
+    State(state): State<AppState>,
+    Query(query): Query<ClassificationQuery>,
+) -> Result<Json<Value>> {
+    state.db.run(move |c| {
+        let entries = db::entries(c)?;
+        let views = entry_views(&entries)?;
+        let search = query.q.unwrap_or_default().to_lowercase();
+        let rows: Vec<_> = entries.iter().filter(|e| {
+            matches!(e.kind, Kind::Expense | Kind::Income)
+                && views[&e.id]["net_amount_cents"].as_i64().unwrap_or(0) > 0
+                && (!query.pending.unwrap_or(true) || e.category == "待分类")
+                && query.kind.as_ref().is_none_or(|kind| *kind == e.kind)
+                && (search.is_empty() || format!("{} {} {} {}",e.merchant,e.description,e.category,e.note).to_lowercase().contains(&search))
+        }).collect();
+        let mut grouped = BTreeMap::<String,(usize,i64)>::new();
+        for e in &rows {
+            let group = grouped.entry(e.merchant.clone()).or_default();
+            group.0 += 1;
+            group.1 += views[&e.id]["net_amount_cents"].as_i64().unwrap_or(0);
+        }
+        let mut merchants: Vec<_> = grouped.into_iter().map(|(merchant,(count,amount))|json!({"merchant":merchant,"count":count,"amount_cents":amount})).collect();
+        merchants.sort_by(|a,b| b["count"].as_u64().cmp(&a["count"].as_u64()).then(a["merchant"].as_str().cmp(&b["merchant"].as_str())));
+        let merchants_total = merchants.len();
+        let rows: Vec<_> = rows.into_iter().filter(|e|query.merchant.as_ref().is_none_or(|merchant|e.merchant == *merchant)).collect();
+        let page = query.page.unwrap_or(1).clamp(1,10000);
+        Ok(Json(json!({"entries":rows.iter().skip((page-1)*50).take(50).filter_map(|e|views.get(&e.id)).collect::<Vec<_>>(),"total":rows.len(),"page":page,"merchants":merchants.into_iter().take(100).collect::<Vec<_>>(),"merchants_total":merchants_total})))
+    }).await.map_err(internal)
+}
+
+fn fixed_category() -> bool {
+    true
+}
+
+fn categorize_selected(
+    conn: &mut rusqlite::Connection,
+    input: CategoryBatch,
+) -> db::DbResult<Value> {
+    let category = input.category.trim();
+    if category.is_empty() || category.chars().count() > 60 || category.contains('\0') {
+        return Err("请输入有效分类".into());
+    }
+    if input.ids.is_empty() || input.ids.len() > 500 || input.ids.iter().any(|id| *id <= 0) {
+        return Err("请选择 1–500 笔记录".into());
+    }
+    let ids: HashSet<_> = input.ids.iter().copied().collect();
+    if ids.len() != input.ids.len() {
+        return Err("选择的记录不能重复".into());
+    }
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    let mut updated = 0;
+    for id in &input.ids {
+        let previous = db::entry(&tx, *id)?.ok_or("有记录已删除，请刷新后重新选择")?;
+        if previous.category != category || previous.category_locked != input.category_locked {
+            updated += tx.execute(
+                "UPDATE entries SET payload=json_set(payload,'$.category',?1,'$.category_locked',json(?2)) WHERE id=?3",
+                params![category, if input.category_locked {"true"} else {"false"}, id],
+            ).map_err(|e| e.to_string())?;
+        }
+    }
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(json!({"ok":true,"selected":ids.len(),"updated":updated}))
+}
+
+async fn batch_categories(
+    State(state): State<AppState>,
+    Json(input): Json<CategoryBatch>,
+) -> Result<Json<Value>> {
+    state
+        .db
+        .run(move |c| categorize_selected(c, input).map(Json))
+        .await
+        .map_err(bad)
+}
+
+#[derive(Deserialize)]
 struct SummaryQuery {
     month: String,
     mode: Option<String>,
@@ -600,7 +701,11 @@ async fn subscriptions(State(state): State<AppState>) -> Result<Json<Value>> {
 
 #[derive(Deserialize)]
 struct RuleInput {
+    #[serde(default)]
+    id: Option<i64>,
     pattern: String,
+    #[serde(default)]
+    description_pattern: String,
     category: String,
     kind: Kind,
 }
@@ -612,20 +717,26 @@ fn reclassify_matching(
 ) -> db::DbResult<Value> {
     let mut matched = 0;
     let mut updated = 0;
+    let mut locked_skipped = 0;
     let mut stmt = conn
         .prepare("UPDATE entries SET payload=json_set(payload,'$.category',?1) WHERE id=?2")
         .map_err(|e| e.to_string())?;
     for entry in db::entries(conn)? {
         if !scopes
             .iter()
-            .any(|rule| rule.matches(&entry.kind, &entry.merchant))
+            .any(|rule| rule.matches(&entry.kind, &entry.merchant, &entry.description))
         {
             continue;
         }
         matched += 1;
-        let category = import::matching_rule(&entry.kind, &entry.merchant, rules)
-            .map(|rule| rule.category.as_str())
-            .unwrap_or("待分类");
+        if entry.category_locked {
+            locked_skipped += 1;
+            continue;
+        }
+        let category =
+            import::matching_rule(&entry.kind, &entry.merchant, &entry.description, rules)
+                .map(|rule| rule.category.as_str())
+                .unwrap_or("待分类");
         if category != entry.category {
             if category.trim().is_empty()
                 || category.chars().count() > 60
@@ -640,36 +751,66 @@ fn reclassify_matching(
                 .map_err(|e| e.to_string())?;
         }
     }
-    Ok(json!({"ok":true,"matched":matched,"updated":updated}))
+    Ok(json!({"ok":true,"matched":matched,"updated":updated,"locked_skipped":locked_skipped}))
 }
 
 fn store_rule(conn: &mut rusqlite::Connection, input: RuleInput) -> db::DbResult<Value> {
     let pattern = input.pattern.trim();
+    let description_pattern = input.description_pattern.trim();
     let category = input.category.trim();
-    if pattern.is_empty()
+    if (pattern.is_empty() && description_pattern.is_empty())
         || pattern.chars().count() > 200
         || pattern.contains('\0')
+        || description_pattern.chars().count() > 200
+        || description_pattern.contains('\0')
         || category.is_empty()
         || category.chars().count() > 60
         || category.contains('\0')
     {
-        return Err("请输入有效的商户关键词和分类".into());
+        return Err("请填写商户或商品关键词，以及有效分类".into());
     }
     let tx = conn.transaction().map_err(|e| e.to_string())?;
-    let old_id: Option<i64> = tx
-        .query_row("SELECT id FROM rules WHERE pattern=?1", [pattern], |row| {
-            row.get(0)
-        })
+    let matching_id: Option<i64> = tx
+        .query_row(
+            "SELECT id FROM rules WHERE pattern=?1 AND description_pattern=?2 AND kind=?3",
+            params![pattern, description_pattern, input.kind.as_str()],
+            |row| row.get(0),
+        )
         .optional()
         .map_err(|e| e.to_string())?;
+    let old_id = input.id.or(matching_id);
     let previous = load_rules(&tx)?
         .into_iter()
         .find(|rule| Some(rule.id) == old_id);
-    tx.execute("INSERT INTO rules(pattern,category,kind) VALUES (?1,?2,?3) ON CONFLICT(pattern) DO UPDATE SET category=excluded.category,kind=excluded.kind",
-        params![pattern, category, input.kind.as_str()]).map_err(|e| e.to_string())?;
+    if input.id.is_some() && previous.is_none() {
+        return Err("规则不存在，请刷新后重试".into());
+    }
+    if matching_id.is_some() && matching_id != old_id {
+        return Err("相同条件的规则已存在，请编辑已有规则".into());
+    }
+    if let Some(id) = old_id {
+        tx.execute(
+            "UPDATE rules SET pattern=?1,description_pattern=?2,category=?3,kind=?4 WHERE id=?5",
+            params![
+                pattern,
+                description_pattern,
+                category,
+                input.kind.as_str(),
+                id
+            ],
+        )
+        .map_err(|e| e.to_string())?;
+    } else {
+        tx.execute(
+            "INSERT INTO rules(pattern,description_pattern,category,kind) VALUES (?1,?2,?3,?4)",
+            params![pattern, description_pattern, category, input.kind.as_str()],
+        )
+        .map_err(|e| e.to_string())?;
+    }
     let mut scopes = vec![Rule {
         id: 0,
         pattern: pattern.into(),
+        description_pattern: description_pattern.into(),
         category: category.into(),
         kind: input.kind,
     }];
@@ -941,7 +1082,9 @@ mod tests {
 
     fn rule_input(pattern: &str, category: &str, kind: Kind) -> RuleInput {
         RuleInput {
+            id: None,
             pattern: pattern.into(),
+            description_pattern: String::new(),
             category: category.into(),
             kind,
         }
@@ -1003,7 +1146,10 @@ mod tests {
         let before = snapshot(&conn);
         let result =
             store_rule(&mut conn, rule_input(" 自如 ", " 居家生活 ", Kind::Expense)).unwrap();
-        assert_eq!(result, json!({"ok":true,"matched":2,"updated":2}));
+        assert_eq!(
+            result,
+            json!({"ok":true,"matched":2,"updated":2,"locked_skipped":0})
+        );
         for (identifier, mut after) in snapshot(&conn) {
             let mut old = before[&identifier].clone();
             if identifier == id || identifier == zero_id {
@@ -1055,6 +1201,148 @@ mod tests {
     }
 
     #[test]
+    fn conditional_rules_coexist_override_broad_rules_and_edit_both_scopes() {
+        let db =
+            Database::from_connection(rusqlite::Connection::open_in_memory().unwrap()).unwrap();
+        let mut conn = db.0.lock().unwrap();
+        let mut e = ledger::sample();
+        e.merchant = "京东".into();
+        e.description = "京东-外卖午餐".into();
+        let meal = db::insert(&conn, &e).unwrap().unwrap();
+        e.description = "京东-购物日用品".into();
+        let goods = db::insert(&conn, &e).unwrap().unwrap();
+        let mut broad = rule_input("京东", "日用购物", Kind::Expense);
+        store_rule(&mut conn, broad).unwrap();
+        let mut specific = rule_input("京东", "餐饮", Kind::Expense);
+        specific.description_pattern = "外卖".into();
+        store_rule(&mut conn, specific).unwrap();
+        assert_eq!(load_rules(&conn).unwrap().len(), 2);
+        assert_eq!(db::entry(&conn, meal).unwrap().unwrap().category, "餐饮");
+        broad = rule_input("京东", "购物", Kind::Expense);
+        store_rule(&mut conn, broad).unwrap();
+        assert_eq!(db::entry(&conn, meal).unwrap().unwrap().category, "餐饮");
+        let rules = load_rules(&conn).unwrap();
+        assert_eq!(
+            import::classify(&Kind::Expense, "京东", "外卖订单", &rules),
+            "餐饮"
+        );
+        assert_eq!(
+            import::classify(&Kind::Expense, "京东", "只有编号", &rules),
+            "购物"
+        );
+        let specific_id = rules
+            .iter()
+            .find(|r| r.description_pattern == "外卖")
+            .unwrap()
+            .id;
+        let mut edited = rule_input("京东", "日用品", Kind::Expense);
+        edited.id = Some(specific_id);
+        edited.description_pattern = "购物".into();
+        let result = store_rule(&mut conn, edited).unwrap();
+        assert_eq!(result["updated"], 2);
+        assert_eq!(db::entry(&conn, meal).unwrap().unwrap().category, "购物");
+        assert_eq!(db::entry(&conn, goods).unwrap().unwrap().category, "日用品");
+        delete_rule(&mut conn, specific_id).unwrap();
+        assert_eq!(db::entry(&conn, goods).unwrap().unwrap().category, "购物");
+        let mut only_description = rule_input("", "餐饮", Kind::Expense);
+        only_description.description_pattern = "外卖".into();
+        store_rule(&mut conn, only_description).unwrap();
+        assert_eq!(db::entry(&conn, meal).unwrap().unwrap().category, "餐饮");
+    }
+
+    #[test]
+    fn fixed_categories_survive_rule_changes_and_batch_edits_are_atomic() {
+        let db =
+            Database::from_connection(rusqlite::Connection::open_in_memory().unwrap()).unwrap();
+        let mut conn = db.0.lock().unwrap();
+        let mut e = ledger::sample();
+        e.merchant = "京东".into();
+        let fixed = db::insert(&conn, &e).unwrap().unwrap();
+        let automatic = db::insert(&conn, &e).unwrap().unwrap();
+        conn.execute(
+            "UPDATE entries SET payload=json_set(payload,'$.extra','keep') WHERE id=?1",
+            [fixed],
+        )
+        .unwrap();
+        let before: String = conn
+            .query_row("SELECT payload FROM entries WHERE id=?1", [fixed], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let result = categorize_selected(
+            &mut conn,
+            CategoryBatch {
+                ids: vec![fixed],
+                category: "餐饮".into(),
+                category_locked: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(result["updated"], 1);
+        let result = store_rule(&mut conn, rule_input("京东", "购物", Kind::Expense)).unwrap();
+        assert_eq!(result["locked_skipped"], 1);
+        assert_eq!(db::entry(&conn, fixed).unwrap().unwrap().category, "餐饮");
+        assert_eq!(
+            db::entry(&conn, automatic).unwrap().unwrap().category,
+            "购物"
+        );
+        let broad_id = rule_id(&conn, "京东");
+        delete_rule(&mut conn, broad_id).unwrap();
+        assert_eq!(db::entry(&conn, fixed).unwrap().unwrap().category, "餐饮");
+        assert_eq!(
+            db::entry(&conn, automatic).unwrap().unwrap().category,
+            "待分类"
+        );
+        let after: String = conn
+            .query_row("SELECT payload FROM entries WHERE id=?1", [fixed], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        let mut before: Value = serde_json::from_str(&before).unwrap();
+        let mut after: Value = serde_json::from_str(&after).unwrap();
+        for value in [&mut before, &mut after] {
+            value.as_object_mut().unwrap().remove("category");
+            value.as_object_mut().unwrap().remove("category_locked");
+        }
+        assert_eq!(after, before);
+        assert!(
+            categorize_selected(
+                &mut conn,
+                CategoryBatch {
+                    ids: vec![fixed, 999999],
+                    category: "错误改动".into(),
+                    category_locked: false
+                }
+            )
+            .is_err()
+        );
+        assert_eq!(db::entry(&conn, fixed).unwrap().unwrap().category, "餐饮");
+        assert!(db::entry(&conn, fixed).unwrap().unwrap().category_locked);
+        categorize_selected(
+            &mut conn,
+            CategoryBatch {
+                ids: vec![fixed],
+                category: "餐饮".into(),
+                category_locked: false,
+            },
+        )
+        .unwrap();
+        store_rule(&mut conn, rule_input("京东", "购物", Kind::Expense)).unwrap();
+        assert_eq!(db::entry(&conn, fixed).unwrap().unwrap().category, "购物");
+        assert!(
+            categorize_selected(
+                &mut conn,
+                CategoryBatch {
+                    ids: vec![fixed, fixed],
+                    category: "购物".into(),
+                    category_locked: true
+                }
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn changing_rule_kind_reclassifies_old_and_new_scopes() {
         let db =
             Database::from_connection(rusqlite::Connection::open_in_memory().unwrap()).unwrap();
@@ -1071,7 +1359,9 @@ mod tests {
             rule_input("merchant", "旧支出分类", Kind::Expense),
         )
         .unwrap();
-        let result = store_rule(&mut conn, rule_input("MERCHANT", "工资", Kind::Income)).unwrap();
+        let mut edited = rule_input("MERCHANT", "工资", Kind::Income);
+        edited.id = Some(rule_id(&conn, "merchant"));
+        let result = store_rule(&mut conn, edited).unwrap();
         assert_eq!(result["updated"], 2);
         assert_eq!(load_rules(&conn).unwrap().len(), 1);
         assert_eq!(
@@ -1167,6 +1457,7 @@ mod tests {
             "/api/subscriptions",
             "/api/export",
             "/api/refund-targets",
+            "/api/classification",
         ] {
             let r = app
                 .clone()

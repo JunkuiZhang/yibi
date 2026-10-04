@@ -16,21 +16,33 @@ const MAX_EXPANDED: u64 = 32 * 1024 * 1024;
 pub struct Rule {
     pub id: i64,
     pub pattern: String,
+    #[serde(default)]
+    pub description_pattern: String,
     pub category: String,
     pub kind: Kind,
 }
 
 impl Rule {
-    pub fn matches(&self, kind: &Kind, merchant: &str) -> bool {
+    pub fn matches(&self, kind: &Kind, merchant: &str, description: &str) -> bool {
         self.kind == *kind
             && merchant
                 .to_lowercase()
                 .contains(&self.pattern.to_lowercase())
+            && description
+                .to_lowercase()
+                .contains(&self.description_pattern.to_lowercase())
     }
 }
 
-pub fn matching_rule<'a>(kind: &Kind, merchant: &str, rules: &'a [Rule]) -> Option<&'a Rule> {
-    rules.iter().find(|rule| rule.matches(kind, merchant))
+pub fn matching_rule<'a>(
+    kind: &Kind,
+    merchant: &str,
+    description: &str,
+    rules: &'a [Rule],
+) -> Option<&'a Rule> {
+    rules
+        .iter()
+        .find(|rule| rule.matches(kind, merchant, description))
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -50,7 +62,7 @@ pub struct Preview {
 }
 
 pub fn classify(kind: &Kind, merchant: &str, description: &str, rules: &[Rule]) -> String {
-    if let Some(rule) = matching_rule(kind, merchant, rules) {
+    if let Some(rule) = matching_rule(kind, merchant, description, rules) {
         return rule.category.clone();
     }
     let text = format!("{merchant} {description}").to_lowercase();
@@ -421,6 +433,7 @@ fn parse_table(table: Vec<Vec<String>>, rules: &[Rule]) -> Result<Preview, Strin
             merchant,
             description,
             category,
+            category_locked: false,
             account,
             note: String::new(),
             split_start: None,
@@ -703,6 +716,7 @@ mod tests {
         let rules = vec![Rule {
             id: 1,
             pattern: "小店".into(),
+            description_pattern: String::new(),
             category: "兴趣爱好".into(),
             kind: Kind::Expense,
         }];

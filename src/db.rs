@@ -52,7 +52,7 @@ fn initialize(conn: &mut Connection) -> DbResult<()> {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .map_err(|e| e.to_string())?;
-    if version > 2 {
+    if version > 3 {
         return Err("数据库版本较新，请使用新版“一笔”".into());
     }
     conn.execute_batch(
@@ -67,7 +67,7 @@ fn initialize(conn: &mut Connection) -> DbResult<()> {
     let version: i64 = tx
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .map_err(|e| e.to_string())?;
-    if version > 2 {
+    if version > 3 {
         return Err("数据库版本较新，请使用新版“一笔”".into());
     }
     if version == 1 {
@@ -103,6 +103,33 @@ fn initialize(conn: &mut Connection) -> DbResult<()> {
             tx.execute_batch(&definition).map_err(|e| e.to_string())?;
         }
     }
+    if version == 1 || version == 2 {
+        let definitions = {
+            let mut stmt = tx.prepare("SELECT sql FROM sqlite_schema WHERE tbl_name='rules' AND type IN ('index','trigger') AND sql IS NOT NULL ORDER BY type,name")
+                .map_err(|e| e.to_string())?;
+            stmt.query_map([], |row| row.get::<_, String>(0))
+                .map_err(|e| e.to_string())?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| e.to_string())?
+        };
+        tx.execute_batch(
+            "CREATE TABLE rules_v3 (
+            id INTEGER PRIMARY KEY,
+            pattern TEXT NOT NULL COLLATE NOCASE,
+            description_pattern TEXT NOT NULL DEFAULT '' COLLATE NOCASE,
+            category TEXT NOT NULL,
+            kind TEXT NOT NULL CHECK(kind IN ('expense','income','transfer','refund')),
+            UNIQUE(kind,pattern,description_pattern)
+        );
+        INSERT INTO rules_v3 (id,pattern,category,kind) SELECT id,pattern,category,kind FROM rules;
+        DROP TABLE rules;
+        ALTER TABLE rules_v3 RENAME TO rules;",
+        )
+        .map_err(|e| format!("数据库升级失败，原数据已保留：{e}"))?;
+        for definition in definitions {
+            tx.execute_batch(&definition).map_err(|e| e.to_string())?;
+        }
+    }
     tx.execute_batch(include_str!("schema.sql"))
         .map_err(|e| e.to_string())?;
     tx.execute(
@@ -110,7 +137,7 @@ fn initialize(conn: &mut Connection) -> DbResult<()> {
         [DEFAULT_START],
     )
     .map_err(|e| e.to_string())?;
-    tx.pragma_update(None, "user_version", 2)
+    tx.pragma_update(None, "user_version", 3)
         .map_err(|e| e.to_string())?;
     tx.commit().map_err(|e| e.to_string())
 }
@@ -342,7 +369,7 @@ mod tests {
         let (mut conn, payload) = old_database();
         let before = table_payloads(&conn);
         initialize(&mut conn).unwrap();
-        assert_eq!(version(&conn), 2);
+        assert_eq!(version(&conn), 3);
         assert_eq!(table_payloads(&conn), before);
         let stored: String = conn
             .query_row("SELECT payload FROM entries WHERE id=42", [], |row| {
@@ -423,16 +450,82 @@ mod tests {
         conn.execute("UPDATE entries SET amount_cents=14800 WHERE id=42", [])
             .unwrap();
         initialize(&mut conn).unwrap();
+        assert_eq!(version(&conn), 3);
+    }
+
+    #[test]
+    fn v2_rules_upgrade_preserves_ids_payloads_and_allows_multiple_merchant_conditions() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            &V1_SCHEMA
+                .replace("amount_cents>0", "amount_cents>=0")
+                .replace("user_version=1", "user_version=2"),
+        )
+        .unwrap();
+        conn.execute_batch("INSERT INTO rules VALUES (19,'京东','日用购物','expense');
+            CREATE INDEX rules_kind_test ON rules(kind);
+            CREATE TABLE rule_audit (rule_id INTEGER);
+            CREATE TRIGGER rules_test_audit AFTER UPDATE ON rules BEGIN INSERT INTO rule_audit VALUES (NEW.id); END;").unwrap();
+        let e = crate::ledger::sample();
+        let payload = serde_json::to_string(&e).unwrap();
+        conn.execute("INSERT INTO entries (id,date,kind,amount_cents,source,payload) VALUES (331,?1,'expense',?2,'manual',?3)",params![e.date,e.amount_cents,payload]).unwrap();
+        initialize(&mut conn).unwrap();
+        assert_eq!(version(&conn), 3);
+        let rule: (i64, String, String, String) = conn
+            .query_row(
+                "SELECT id,pattern,description_pattern,category FROM rules",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(rule, (19, "京东".into(), "".into(), "日用购物".into()));
+        let stored: String = conn
+            .query_row("SELECT payload FROM entries WHERE id=331", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stored, payload);
+        conn.execute("INSERT INTO rules(pattern,description_pattern,category,kind) VALUES ('京东','外卖','餐饮','expense')",[]).unwrap();
+        conn.execute("INSERT INTO rules(pattern,description_pattern,category,kind) VALUES ('京东','外卖','其他收入','income')",[]).unwrap();
+        assert!(conn.execute("INSERT INTO rules(pattern,description_pattern,category,kind) VALUES ('京东','外卖','重复','expense')",[]).is_err());
+        conn.execute("UPDATE rules SET category='购物' WHERE id=19", [])
+            .unwrap();
+        let audited: i64 = conn
+            .query_row("SELECT rule_id FROM rule_audit", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(audited, 19);
+        initialize(&mut conn).unwrap();
+        assert_eq!(version(&conn), 3);
+    }
+
+    #[test]
+    fn failed_v2_rule_upgrade_rolls_back_every_table_and_version() {
+        let (mut conn, payload) = old_database();
+        conn.execute_batch("PRAGMA user_version=2; UPDATE rules SET kind='invalid' WHERE id=7;")
+            .unwrap();
+        let before = table_payloads(&conn);
+        assert!(initialize(&mut conn).unwrap_err().contains("升级失败"));
         assert_eq!(version(&conn), 2);
+        assert_eq!(table_payloads(&conn), before);
+        let stored: String = conn
+            .query_row("SELECT payload FROM entries WHERE id=42", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stored, payload);
+        let leftovers: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema WHERE name='rules_v3'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(leftovers, 0);
     }
 
     #[test]
     fn newer_database_version_is_rejected_without_changes() {
         let (mut conn, _) = old_database();
-        conn.pragma_update(None, "user_version", 3).unwrap();
+        conn.pragma_update(None, "user_version", 4).unwrap();
         let before = table_payloads(&conn);
         assert!(initialize(&mut conn).unwrap_err().contains("版本较新"));
-        assert_eq!(version(&conn), 3);
+        assert_eq!(version(&conn), 4);
         assert_eq!(table_payloads(&conn), before);
         assert!(
             conn.execute("UPDATE entries SET amount_cents=0 WHERE id=42", [])

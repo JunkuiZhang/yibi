@@ -18,8 +18,10 @@ CREATE TABLE IF NOT EXISTS entries (
 CREATE INDEX IF NOT EXISTS entries_date ON entries(date);
 CREATE TABLE IF NOT EXISTS rules (
     id INTEGER PRIMARY KEY,
-    pattern TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    pattern TEXT NOT NULL COLLATE NOCASE,
+    description_pattern TEXT NOT NULL DEFAULT '' COLLATE NOCASE,
     category TEXT NOT NULL,
-    kind TEXT NOT NULL
+    kind TEXT NOT NULL CHECK(kind IN ('expense','income','transfer','refund')),
+    UNIQUE(kind,pattern,description_pattern)
 );
 CREATE TABLE IF NOT EXISTS previews (token TEXT PRIMARY KEY, created INTEGER NOT NULL, payload TEXT NOT NULL);
