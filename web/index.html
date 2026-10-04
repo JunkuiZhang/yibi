@@ -67,7 +67,9 @@
         <div id="split-fields" hidden><div class="form-grid"><label>费用开始月份<input name="split_start" type="month"></label><label>分摊月数<input name="split_months" type="number" value="12" min="2" max="120" step="1"></label></div><p id="split-hint" class="muted small"></p></div>
       </div>
       <label>备注<textarea name="note" rows="2" maxlength="1000" placeholder="留一点想记住的细节（选填）"></textarea></label>
+      <label class="check-label rule-check"><input name="category_locked" type="checkbox"><span>固定此笔分类<small>保存、删除或重算规则时，都保留此笔分类</small></span></label>
       <label class="check-label rule-check"><input name="remember_rule" type="checkbox"><span>将此商户的同类型账单统一分类，并用于后续导入</span></label>
+      <div id="remember-rule-options" hidden><label>再限定商品 / 用途关键词（选填）<input name="rule_description" maxlength="200" placeholder="例如：外卖、游戏点卡"></label><p class="muted small">填写后需同时命中商户和商品关键词。只有订单编号时无法区分用途，可固定单笔分类或批量勾选处理。</p></div>
       <p id="entry-error" class="form-error" role="alert"></p>
       <div class="dialog-footer"><button id="delete-entry" type="button" class="button danger ghost" hidden>删除记录</button><span class="spacer"></span><button type="button" class="button secondary" data-action="close-dialog">取消</button><button type="submit" class="button primary">保存记录<svg><use href="#i-check"/></svg></button></div>
     </form>

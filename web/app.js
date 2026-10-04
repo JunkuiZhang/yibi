@@ -13,6 +13,7 @@ const kindName = {expense:"支出",income:"收入",transfer:"转账",refund:"退
 const categories = ["餐饮","日用购物","交通出行","居家生活","会员订阅","医疗健康","通讯网络","学习成长","休闲娱乐","兴趣爱好","人情往来","其他支出","待分类"];
 const colors = ["#6e8860","#9bb589","#c2cbb1","#e3d5b5","#b6c9c3","#adb4a2"];
 const state = {tab:"overview",month:today.slice(0,7),mode:"cash",data:null,pool:new Map(),page:1,search:"",kind:"",preview:null,selected:new Set(),previewPage:1,withBonus:true,subscriptionFilter:"all",expandedBikeGroups:new Set()};
+const classificationState = {page:1,search:"",kind:"",merchant:null,pending:true,selected:new Set(),visible:[],merchants:[],category:"",locked:true};
 let renderVersion=0,toastTimer,refundSearchTimer,refundSearchVersion=0;
 let editingLinkedRefunds=0;
 try { state.mode=localStorage.getItem("tally-mode")==="allocated" ? "allocated":"cash"; } catch {}
@@ -24,6 +25,7 @@ function toast(message, error=false) {
 function showLogin() {
   renderVersion++;refundSearchVersion++;clearTimeout(refundSearchTimer);$("#app").hidden=true;$("#login-screen").hidden=false;$("#initial-loading").hidden=true;
   $("#content").replaceChildren();$("#entry-dialog").close();state.pool.clear();state.expandedBikeGroups.clear();state.preview=null;state.selected.clear();state.data=null;
+  classificationState.selected.clear();classificationState.merchant=null;classificationState.search="";classificationState.category="";
   $("#login-form").elements.password.value="";
 }
 async function api(path, options={}) {
@@ -116,7 +118,7 @@ async function entriesView() {
   if(state.page>lastPage){state.page=lastPage;return entriesView();}
   cacheEntries(result.entries);
   return heading("每一笔，都有来处。",`${monthLabel(state.month)} · 搜索、分类，也可以补上从前的记录。`,modeSwitch())+
-    `<form id="search-form" class="toolbar"><label class="search-box">${icon("search")}<input name="q" value="${esc(state.search)}" aria-label="搜索流水" placeholder="搜索商户、分类、用途或备注"></label><select name="kind" aria-label="筛选收支类型"><option value="">全部类型</option>${Object.entries(kindName).map(([k,v])=>`<option value="${k}" ${state.kind===k?"selected":""}>${v}</option>`).join("")}</select><button class="button secondary" type="submit">筛选</button><button class="button secondary" type="button" data-action="salary">${icon("down")}记工资</button></form>`+
+    `<form id="search-form" class="toolbar"><label class="search-box">${icon("search")}<input name="q" value="${esc(state.search)}" aria-label="搜索流水" placeholder="搜索商户、分类、用途或备注"></label><select name="kind" aria-label="筛选收支类型"><option value="">全部类型</option>${Object.entries(kindName).map(([k,v])=>`<option value="${k}" ${state.kind===k?"selected":""}>${v}</option>`).join("")}</select><button class="button secondary" type="submit">筛选</button><button class="button secondary" type="button" data-tab="classification">整理分类</button><button class="button secondary" type="button" data-action="salary">${icon("down")}记工资</button></form>`+
     `<section class="card card-pad">${transactionTable(result.entries)}<div class="table-footer"><span>${state.search || state.kind?"筛选匹配":"共"} ${result.total} 笔${result.display_total<result.total?` · 合并展示为 ${result.display_total} 行`:""} · ${state.mode==="cash"?"转账不计入收支":"分摊记录保留原付款日期"}</span>${pagination(state.page,Math.ceil((result.display_total ?? result.total)/50),"page")}</div></section>`;
 }
 function pagination(page,pages,action) {
@@ -146,29 +148,52 @@ function previewView() {
   return heading("入账之前，再看一眼。",`已识别 ${p.source==="wechat"?"微信":"支付宝"}账单。预览保留 30 分钟；重新上传会替换当前预览。`,'<button class="button secondary" data-action="cancel-import">重新选择文件</button>')+
     `<div class="preview-summary"><span class="pill">${p.rows.length} 条明细</span><span class="pill">${duplicates} 条重复</span><span class="pill">${p.skipped} 条未完成交易已跳过</span><span class="pill">${p.errors.length} 条无法解析</span></div><section class="card card-pad"><div class="toolbar"><span class="muted small">早于记账起点的记录默认不选，可按需勾选。原付款按退款后净额入账，独立退款留档不计收支。零元记录会保留；零元共享单车入账后按月收起，预览仍逐笔核对。</span><div><button class="link-button" data-action="select-import">全选可导入项</button><button class="link-button" data-action="clear-import">清空选择</button></div></div><div class="table-scroll"><table class="preview-table"><thead><tr><th>选择</th><th>日期 / 交易对象</th><th>类型</th><th>计入金额</th><th>分类</th><th>核对信息</th></tr></thead><tbody>${visible.map((r,i)=>`<tr class="${r.duplicate?"row-duplicate":""}"><td><input type="checkbox" data-import-index="${start+i}" ${state.selected.has(start+i)?"checked":""} ${r.duplicate?"disabled":""} aria-label="导入第 ${r.line} 行"></td><td><div class="transaction-name"><div><strong>${esc(r.entry.merchant || r.entry.description || "交易")}</strong><small>${esc(r.entry.date)}</small></div></div></td><td>${kindName[r.entry.kind]}</td><td class="amount ${r.entry.amount_cents===0?"zero-amount":r.entry.kind==="income"?"positive":""}">${amountDisplay(r.entry)}</td><td><span class="tag">${esc(r.entry.category)}</span></td><td><div class="preview-warning">${r.duplicate?"重复记录，将跳过":esc(r.warnings.join("；")) || "✓ 可以导入"}</div></td></tr>`).join("")}</tbody></table></div><div class="table-footer"><span>预览第 ${Math.min(start+1,p.rows.length)}–${Math.min(start+100,p.rows.length)} 条</span>${pagination(state.previewPage,Math.ceil(p.rows.length/100),"preview-page")}</div>${p.errors.length?`<details class="errors-list"><summary>${p.errors.length} 条无法解析的行（不会入账）</summary><ul>${p.errors.map(e=>`<li>${esc(e)}</li>`).join("")}</ul></details>`:""}<div class="preview-actions"><span id="selected-count" class="muted">已选择 ${state.selected.size} 条</span><button id="commit-import" class="button primary" data-action="commit-import" ${state.selected.size?"":"disabled"}>确认入账 ${icon("check")}</button></div></section>`;
 }
-function ruleFeedback(result,label) {return result.matched?`${label}，匹配 ${result.matched} 笔，更新 ${result.updated} 笔分类`:`${label}，暂无匹配记录`;}
+function ruleFeedback(result,label) {return result.matched?`${label}，匹配 ${result.matched} 笔，更新 ${result.updated} 笔分类${result.locked_skipped?`，保留 ${result.locked_skipped} 笔固定分类`:""}`:`${label}，暂无匹配记录`;}
+async function classificationView() {
+  const version=renderVersion;
+  const c=classificationState,query=new URLSearchParams({q:c.search,pending:c.pending,page:c.page});
+  if(c.kind)query.set("kind",c.kind);
+  if(c.merchant!==null)query.set("merchant",c.merchant);
+  const result=await api(`/api/classification?${query}`),pages=Math.max(1,Math.ceil(result.total/50));
+  if(version!==renderVersion)return "";
+  if(c.page>pages){c.page=pages;return classificationView();}
+  cacheEntries(result.entries);c.visible=result.entries;c.merchants=result.merchants;
+  const choices=[...new Set([...categories,"工资","年终奖","利息","其他收入",...state.data.rules.map(r=>r.category),...state.pool.values()].map(v=>typeof v==="string"?v:v.category))];
+  return heading("把分类，整理清楚。","跨月份整理有金额的收支。信息不足的商户，可分别勾选购物和外卖。",'<button class="button secondary" data-tab="entries">返回流水</button>')+
+    `<form id="classification-search" class="toolbar"><label class="search-box">${icon("search")}<input name="q" value="${esc(c.search)}" aria-label="搜索待整理记录" placeholder="搜索商户、商品或备注"></label><select name="kind" aria-label="整理收支类型"><option value="">收入和支出</option>${["expense","income"].map(k=>`<option value="${k}" ${c.kind===k?"selected":""}>${kindName[k]}</option>`).join("")}</select><label class="check-label"><input name="pending" type="checkbox" ${c.pending?"checked":""}>只看待分类</label><button class="button secondary">筛选</button></form>`+
+    `<section class="card card-pad"><div class="card-header"><div><h2>按交易对象整理</h2><p>${result.merchants_total} 个交易对象${result.merchants_total>100?" · 先展示 100 个，可搜索缩小范围":""} · 点击查看，分类只影响勾选的记录</p></div></div><div class="merchant-groups"><button class="merchant-chip ${c.merchant===null?"active":""}" data-action="all-merchants">全部</button>${c.merchants.map((g,i)=>`<button class="merchant-chip ${c.merchant===g.merchant?"active":""}" data-merchant-index="${i}"><strong>${esc(g.merchant || "未填写交易对象")}</strong><small>${g.count} 笔 · ${yuan(g.amount_cents)}</small></button>`).join("")}</div></section>`+
+    `<section class="card card-pad classification-records"><form id="classification-batch" class="classification-batch"><strong id="classification-selected">已选择 ${c.selected.size} 笔</strong><label>归入分类<input name="category" list="classification-categories" maxlength="60" value="${esc(c.category)}" required placeholder="选择或输入分类"></label><label class="check-label"><input name="locked" type="checkbox" ${c.locked?"checked":""}>固定分类，规则不覆盖</label><button id="classification-save" class="button primary" ${c.selected.size?"":"disabled"}>保存选中记录</button><button type="button" class="link-button" data-action="clear-classification">清空选择</button></form><datalist id="classification-categories">${choices.map(v=>`<option value="${esc(v)}">`).join("")}</datalist><p class="muted small">当前查看${c.merchant===null?"全部交易对象":esc(c.merchant || "未填写交易对象")}。批量保存不创建商户规则；取消固定后，记录可再次跟随规则更新。</p>${result.entries.length?`<div class="table-scroll"><table class="classification-table"><thead><tr><th><input type="checkbox" id="classification-select-page" aria-label="选择当前页" ${result.entries.every(e=>c.selected.has(e.id))?"checked":""}></th><th>日期 / 交易对象 / 商品说明</th><th>分类</th><th class="align-right">净额</th><th></th></tr></thead><tbody>${result.entries.map(e=>`<tr><td><input type="checkbox" data-classification-id="${e.id}" aria-label="选择 ${esc(e.date+' '+e.merchant)}" ${c.selected.has(e.id)?"checked":""}></td><td><strong>${esc(e.merchant || "未填写交易对象")}</strong><small>${esc(e.date)} · ${kindName[e.kind]}</small><p>${esc(e.description || "没有商品说明")}</p></td><td><span class="tag ${e.category==="待分类"?"warn":""}">${esc(e.category)}</span>${e.category_locked?'<small>已固定</small>':""}</td><td class="amount">${yuan(netAmount(e))}</td><td><button class="link-button" data-edit="${e.id}">编辑</button></td></tr>`).join("")}</tbody></table></div>`:empty("这组记录已经整理好了","切换交易对象，或取消“只看待分类”查看已分类的记录。")}<div class="table-footer"><span>共 ${result.total} 笔 · 选择可跨页保留</span>${pagination(c.page,pages,"classification-page")}</div></section>`;
+}
+function classificationSelection() {
+  const c=classificationState;
+  $("#classification-selected").textContent=`已选择 ${c.selected.size} 笔`;
+  $("#classification-save").disabled=!c.selected.size;
+  const all=$("#classification-select-page");
+  if(all){const count=c.visible.filter(e=>c.selected.has(e.id)).length;all.checked=count===c.visible.length;all.indeterminate=count>0 && count<c.visible.length;}
+}
 function settingsView() {
   return heading("一本账本，按你的方式。","调整记账起点、整理分类习惯，或带走自己的数据。")+
-    `<div class="settings-grid"><div class="settings-stack"><section class="card card-pad"><h2>记账起点</h2><p>从这个月份开始展示正式收支。此前补录的会员仍按原始期限分摊，保留付款记录。</p><form id="settings-form"><label>正式记账开始月份<input type="month" name="start" value="${state.data.ledger_start.slice(0,7)}" min="1900-01" max="2199-12" required></label><button class="button primary">保存设置</button></form></section><section class="card card-pad"><h2>我的数据</h2><p>导出包含全部流水、分摊信息和分类规则的 JSON 文件。完整恢复请使用服务器数据库备份。</p><button class="button secondary" data-action="export">${icon("down")}导出账本数据</button></section><section class="card card-pad"><h2>私人账户</h2><p>当前登录：${esc(state.data.username)}。修改或找回密码需通过服务器上的账户管理命令完成。</p><button class="button secondary" data-action="logout">${icon("exit")}退出登录</button></section></div><section class="card card-pad"><h2>我的分类习惯</h2><p>匹配商户名称和收支类型，长关键词优先。保存时同步更新所有月份的匹配账单；删除后按剩余自定义规则重算，未命中则待分类。</p><form id="rule-form" class="inline-form"><label>商户关键词<input name="pattern" required maxlength="200" placeholder="例如：某家咖啡店"></label><label>归入分类<input name="category" list="categories" required maxlength="60" placeholder="例如：餐饮"></label><label>适用类型<select name="kind">${Object.entries(kindName).map(([k,v])=>`<option value="${k}">${v}</option>`).join("")}</select></label><button class="button secondary">${icon("plus")}保存并更新账单</button></form><div class="toolbar"><button class="button secondary" data-action="apply-rules" ${state.data.rules.length?"":"disabled"}>重新应用全部规则</button><span class="muted small">同步更新匹配记录，包括已手动分类的账单</span></div><div class="rules-list">${state.data.rules.length?state.data.rules.map(r=>`<div class="rule-row"><div><strong>${esc(r.pattern)} → ${esc(r.category)}</strong><small>${kindName[r.kind]} · 商户名称包含关键词</small></div><button class="link-button danger" data-delete-rule="${r.id}">移除</button></div>`).join(""):empty("还没有自己的分类规则","编辑流水时，可以顺便记住商户的分类习惯。")}</div></section></div>`;
+    `<div class="settings-grid"><div class="settings-stack"><section class="card card-pad"><h2>记账起点</h2><p>从这个月份开始展示正式收支。此前补录的会员仍按原始期限分摊，保留付款记录。</p><form id="settings-form"><label>正式记账开始月份<input type="month" name="start" value="${state.data.ledger_start.slice(0,7)}" min="1900-01" max="2199-12" required></label><button class="button primary">保存设置</button></form></section><section class="card card-pad"><h2>我的数据</h2><p>导出包含全部流水、分摊信息和分类规则的 JSON 文件。完整恢复请使用服务器数据库备份。</p><button class="button secondary" data-action="export">${icon("down")}导出账本数据</button></section><section class="card card-pad"><h2>私人账户</h2><p>当前登录：${esc(state.data.username)}。修改或找回密码需通过服务器上的账户管理命令完成。</p><button class="button secondary" data-action="logout">${icon("exit")}退出登录</button></section></div><section class="card card-pad"><h2>我的分类习惯</h2><p>商户与商品关键词同时满足才匹配；商品条件优先，再按关键词总长度排序。保存、编辑时同步历史账单；删除后按剩余规则重算，未命中则待分类。固定分类始终保留。</p><button class="button secondary" data-tab="classification">整理待分类记录</button><form id="rule-form" class="inline-form"><input name="rule_id" type="hidden"><label>商户关键词（可选）<input name="pattern" maxlength="200" placeholder="例如：京东"></label><label>商品 / 用途关键词（可选）<input name="description_pattern" maxlength="200" placeholder="例如：外卖、游戏点卡"></label><label>归入分类<input name="category" list="categories" required maxlength="60" placeholder="例如：餐饮"></label><label>适用类型<select name="kind">${Object.entries(kindName).map(([k,v])=>`<option value="${k}">${v}</option>`).join("")}</select></label><p class="span-two small muted">至少填写一个关键词。京东只有订单编号的记录，需到“整理分类”中按实际用途勾选处理。</p><button id="rule-save" class="button secondary">保存并更新账单</button><button type="button" id="rule-cancel" class="link-button" data-action="cancel-rule-edit" hidden>取消编辑</button></form><div class="toolbar"><button class="button secondary" data-action="apply-rules" ${state.data.rules.length?"":"disabled"}>重新应用全部规则</button><span class="muted small">更新未固定的匹配记录</span></div><div class="rules-list">${state.data.rules.length?state.data.rules.map(r=>`<div class="rule-row"><div><strong>${esc(r.pattern || "任意商户")}${r.description_pattern?` + ${esc(r.description_pattern)}`:""} → ${esc(r.category)}</strong><small>${kindName[r.kind]} · ${r.description_pattern?"商品和商户同时匹配":"商户名称包含关键词"}</small></div><button class="link-button" data-edit-rule="${r.id}">编辑</button><button class="link-button danger" data-delete-rule="${r.id}">移除</button></div>`).join(""):empty("还没有自己的分类规则","编辑流水时，可以顺便记住商户的分类习惯。")}</div></section></div>`;
 }
 async function render() {
   const version=++renderVersion;
-  $("#page-name").textContent={overview:"生活概览",entries:"账单流水",subscriptions:"会员与分摊",import:"导入账单",settings:"账本设置"}[state.tab];
-  document.querySelectorAll(".sidebar [data-tab]").forEach(b=>{b.classList.toggle("active",b.dataset.tab===state.tab);b.setAttribute("aria-current",b.dataset.tab===state.tab?"page":"false");});
-  $("#month").closest("label").hidden=["import","settings"].includes(state.tab);
+  $("#page-name").textContent={overview:"生活概览",entries:"账单流水",subscriptions:"会员与分摊",import:"导入账单",settings:"账本设置",classification:"整理分类"}[state.tab];
+  document.querySelectorAll(".sidebar [data-tab]").forEach(b=>{b.classList.toggle("active",b.dataset.tab===(state.tab==="classification"?"entries":state.tab));b.setAttribute("aria-current",b.dataset.tab===(state.tab==="classification"?"entries":state.tab)?"page":"false");});
+  $("#month").closest("label").hidden=["import","settings","classification"].includes(state.tab);
   $("#content").innerHTML='<div class="loading"><span>整理你的生活记录…</span></div>';
   try {
-    const html=await ({overview,entries:entriesView,subscriptions:subscriptionsView,import:importView,settings:settingsView}[state.tab])();
+    const html=await ({overview,entries:entriesView,subscriptions:subscriptionsView,import:importView,settings:settingsView,classification:classificationView}[state.tab])();
     if(version!==renderVersion || !state.data)return;
     $("#content").innerHTML=html;
     if(state.tab==="import" && !state.preview)bindUpload();
+    if(state.tab==="classification")classificationSelection();
   } catch(e) {
     if(version!==renderVersion)return;
     $("#content").innerHTML=empty("暂时没能打开账本",esc(e.message),'<button class="button secondary" data-action="retry">重试</button>');
   }
 }
 async function refresh(){await bootstrap();await render();}
-function changeTab(tab){state.tab=tab;state.page=1;render();}
+function changeTab(tab){if(state.tab==="classification" || tab==="classification")classificationState.selected.clear();state.tab=tab;state.page=1;render();}
 let categorySuggestions=[],activeCategory=-1;
 function categoryChoices() {
   const kind=$("#entry-form").elements.kind.value;
@@ -254,6 +279,7 @@ function openEntry(entry=null, preset="") {
   f.date.value=base.date || today;f.amount.value=base.amount_cents!==undefined?(base.amount_cents/100).toFixed(2):"";
   f.merchant.value=base.merchant || "";f.description.value=base.description || "";f.note.value=base.note || "";
   f.category.value=base.category || (preset==="salary"?"工资":preset==="membership"?"会员订阅":"待分类");
+  f.category_locked.checked=!!base.category_locked;$("#remember-rule-options").hidden=true;
   f.account.value=base.account || (preset==="salary"?"工资卡":"微信");
   f.refunded.value=((base.refunded_cents || 0)/100).toFixed(2);
   f.refund_of.innerHTML='<option value="">不关联，只保留退款流水</option>'+(base.refund_of?`<option value="${Number(base.refund_of)}">${esc(base.refund_target?targetLabel(base.refund_target):"已关联的原支出")}</option>`:"");
@@ -266,13 +292,13 @@ async function saveEntry(event) {
   event.preventDefault();const form=event.target,f=form.elements,button=$("button[type=submit]",form);button.disabled=true;$("#entry-error").textContent="";
   try {
     const split=f.kind.value==="expense" && f.split.checked;
-    const entry={date:f.date.value,kind:f.kind.value,amount_cents:cents(f.amount.value,f.kind.value!=="refund"),merchant:f.merchant.value.trim(),description:f.description.value.trim(),category:f.category.value.trim(),account:f.account.value.trim(),note:f.note.value.trim(),split_start:split?f.split_start.value:null,split_months:split?Number(f.split_months.value):null,refunded_cents:f.kind.value==="expense"?cents(f.refunded.value || "0",true):0,refund_of:f.kind.value==="refund" && f.refund_of.value?Number(f.refund_of.value):null};
+    const entry={date:f.date.value,kind:f.kind.value,amount_cents:cents(f.amount.value,f.kind.value!=="refund"),merchant:f.merchant.value.trim(),description:f.description.value.trim(),category:f.category.value.trim(),category_locked:f.category_locked.checked,account:f.account.value.trim(),note:f.note.value.trim(),split_start:split?f.split_start.value:null,split_months:split?Number(f.split_months.value):null,refunded_cents:f.kind.value==="expense"?cents(f.refunded.value || "0",true):0,refund_of:f.kind.value==="refund" && f.refund_of.value?Number(f.refund_of.value):null};
     if(split && entry.amount_cents===0)throw new Error("零元记录无需分摊，请取消分摊设置。");
     if(entry.kind==="expense" && Math.max(entry.refunded_cents,editingLinkedRefunds)>entry.amount_cents)throw new Error("累计退款不能超过原始支付金额。");
     if(f.remember_rule.checked && !entry.merchant)throw new Error("记住分类规则时，请填写交易对象。");
     await api(f.id.value?`/api/entries/${f.id.value}`:"/api/entries",{method:f.id.value?"PUT":"POST",body:entry});
     let ruleFailed=false,ruleResult=null;
-    if(f.remember_rule.checked)try{ruleResult=await api("/api/rules",{method:"POST",body:{pattern:entry.merchant,category:entry.category,kind:entry.kind}});}catch{ruleFailed=true;}
+    if(f.remember_rule.checked)try{ruleResult=await api("/api/rules",{method:"POST",body:{pattern:entry.merchant,description_pattern:f.rule_description.value.trim(),category:entry.category,kind:entry.kind}});}catch{ruleFailed=true;}
     $("#entry-dialog").close();toast(ruleFailed?"记录已保存，分类规则未保存，请在设置中重试":ruleResult?ruleFeedback(ruleResult,"记录与规则已保存"):"已经记下这一笔",ruleFailed);
     await refresh();
   }catch(e){$("#entry-error").textContent=e.message;}finally{button.disabled=false;}
@@ -304,8 +330,18 @@ document.addEventListener("click",async event=>{
     if(b.dataset.mode){state.mode=b.dataset.mode;state.page=1;try{localStorage.setItem("tally-mode",state.mode);}catch{}await render();return;}
     if(b.dataset.edit){openEntry(state.pool.get(Number(b.dataset.edit)));return;}
     if(b.dataset.subFilter){state.subscriptionFilter=b.dataset.subFilter;await render();return;}
-    if(b.dataset.deleteRule){if(confirm("删除这条分类规则？匹配账单将按剩余自定义规则重算，未命中则改为待分类。")){const result=await api(`/api/rules/${b.dataset.deleteRule}`,{method:"DELETE"});toast(ruleFeedback(result,"规则已删除，匹配账单已重算"));await refresh();}return;}
+    if(b.dataset.deleteRule){if(confirm("删除这条分类规则？未固定的匹配账单将按剩余规则重算，未命中则待分类；固定分类会保留。")){const result=await api(`/api/rules/${b.dataset.deleteRule}`,{method:"DELETE"});toast(ruleFeedback(result,"规则已删除，匹配账单已重算"));await refresh();}return;}
+    if(b.dataset.editRule){
+      const r=state.data.rules.find(r=>r.id===Number(b.dataset.editRule)),f=$("#rule-form").elements;
+      f.rule_id.value=r.id;f.pattern.value=r.pattern;f.description_pattern.value=r.description_pattern || "";f.category.value=r.category;f.kind.value=r.kind;
+      $("#rule-save").textContent="保存规则修改";$("#rule-cancel").hidden=false;f.pattern.focus();return;
+    }
+    if(b.dataset.merchantIndex!==undefined){classificationState.merchant=classificationState.merchants[Number(b.dataset.merchantIndex)].merchant;classificationState.page=1;classificationState.selected.clear();await render();return;}
     const action=b.dataset.action;
+    if(action==="cancel-rule-edit"){$("#rule-form").reset();$("#rule-form").elements.rule_id.value="";$("#rule-save").textContent="保存并更新账单";$("#rule-cancel").hidden=true;}
+    if(action==="all-merchants"){classificationState.merchant=null;classificationState.page=1;classificationState.selected.clear();await render();}
+    if(action==="classification-page"){classificationState.page=Number(b.dataset.page);await render();}
+    if(action==="clear-classification"){classificationState.selected.clear();document.querySelectorAll("[data-classification-id]").forEach(e=>e.checked=false);classificationSelection();}
     if(action==="apply-rules"){b.disabled=true;try{const result=await api("/api/rules/apply",{method:"POST"});toast(ruleFeedback(result,"全部规则已应用"));await refresh();}finally{b.disabled=false;}}
     if(action==="close-dialog")$("#entry-dialog").close();
     if(action==="add")openEntry();
@@ -335,7 +371,10 @@ document.addEventListener("click",async event=>{
   }catch(e){toast(e.message,true);}
 });
 document.addEventListener("change",event=>{
-  const element=event.target;
+  const element=event.target,c=classificationState;
+  if(element.dataset.classificationId!==undefined){const id=Number(element.dataset.classificationId);element.checked?c.selected.add(id):c.selected.delete(id);classificationSelection();}
+  if(element.id==="classification-select-page"){for(const e of c.visible)element.checked?c.selected.add(e.id):c.selected.delete(e.id);document.querySelectorAll("[data-classification-id]").forEach(e=>e.checked=c.selected.has(Number(e.dataset.classificationId)));classificationSelection();}
+  if(element.form?.id==="classification-batch" && element.name==="locked")c.locked=element.checked;
   if(element.dataset.importIndex!==undefined){const i=Number(element.dataset.importIndex);element.checked?state.selected.add(i):state.selected.delete(i);$("#selected-count").textContent=`已选择 ${state.selected.size} 条`;$("#commit-import").disabled=!state.selected.size;}
 });
 document.addEventListener("toggle",event=>{
@@ -344,12 +383,14 @@ document.addEventListener("toggle",event=>{
   group.open?state.expandedBikeGroups.add(group.dataset.bikeMonth):state.expandedBikeGroups.delete(group.dataset.bikeMonth);
 },true);
 document.addEventListener("submit",async event=>{
-  const form=event.target;if(!["search-form","settings-form","rule-form"].includes(form.id))return;
+  const form=event.target;if(!["search-form","settings-form","rule-form","classification-search","classification-batch"].includes(form.id))return;
   event.preventDefault();const button=$("button[type=submit],button:not([type])",form);if(button)button.disabled=true;
   try{
     if(form.id==="search-form"){state.search=form.elements.q.value.trim();state.kind=form.elements.kind.value;state.page=1;await render();}
     if(form.id==="settings-form"){await api("/api/settings",{method:"PUT",body:{ledger_start:`${form.elements.start.value}-01`}});toast("记账起点已更新");await refresh();}
-    if(form.id==="rule-form"){const result=await api("/api/rules",{method:"POST",body:{pattern:form.elements.pattern.value.trim(),category:form.elements.category.value.trim(),kind:form.elements.kind.value}});toast(ruleFeedback(result,"规则已保存"));await refresh();}
+    if(form.id==="classification-search"){const c=classificationState;c.search=form.elements.q.value.trim();c.kind=form.elements.kind.value;c.pending=form.elements.pending.checked;c.merchant=null;c.page=1;c.selected.clear();await render();}
+    if(form.id==="classification-batch"){const c=classificationState,result=await api("/api/entries/categories",{method:"POST",body:{ids:[...c.selected],category:form.elements.category.value.trim(),category_locked:form.elements.locked.checked}});c.selected.clear();toast(`已整理 ${result.selected} 笔，更新 ${result.updated} 笔分类设置`);await refresh();}
+    if(form.id==="rule-form"){const f=form.elements,result=await api("/api/rules",{method:"POST",body:{id:f.rule_id.value?Number(f.rule_id.value):null,pattern:f.pattern.value.trim(),description_pattern:f.description_pattern.value.trim(),category:f.category.value.trim(),kind:f.kind.value}});toast(ruleFeedback(result,"规则已保存"));await refresh();}
   }catch(e){toast(e.message,true);}finally{if(button)button.disabled=false;}
 });
 $("#login-form").addEventListener("submit",async event=>{
@@ -382,6 +423,8 @@ $("#entry-category").addEventListener("keydown",event=>{
   const option=options[activeCategory];$("#entry-category").setAttribute("aria-activedescendant",option.id);option.scrollIntoView({block:"nearest"});
 });
 document.addEventListener("pointerdown",event=>{if(!$("#category-picker").contains(event.target))closeCategories();});
+document.addEventListener("input",event=>{if(event.target.form?.id==="classification-batch" && event.target.name==="category")classificationState.category=event.target.value;});
+$("#entry-form").elements.remember_rule.addEventListener("change",event=>$("#remember-rule-options").hidden=!event.target.checked);
 $("#entry-form").elements.kind.addEventListener("change",formKind);
 $("#entry-form").addEventListener("input",splitHint);
 $("#entry-form").elements.split.addEventListener("change",splitHint);
