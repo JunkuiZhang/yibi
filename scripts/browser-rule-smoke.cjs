@@ -19,13 +19,13 @@ const config=JSON.parse(fs.readFileSync(process.env.TALLY_BROWSER_CONFIG,'utf8')
   async function saveRule(pattern,value){
     const rule=page.locator('#rule-form');await rule.locator('[name=pattern]').fill(pattern);
     await rule.locator('[name=category]').fill(value);
-    await rule.locator('button').click();
+    await rule.locator('#rule-save').click();
     await page.waitForFunction(()=>document.querySelector('#toast').textContent.includes('规则已保存'));
     await page.waitForFunction(()=>document.querySelector('#rule-form [name=pattern]')?.value==='');
   }
   async function deleteRule(pattern){
     page.once('dialog',async dialog=>{
-      assert.match(dialog.message(),/剩余自定义规则.*待分类/);await dialog.accept();
+      assert.match(dialog.message(),/剩余规则.*待分类.*固定分类/);await dialog.accept();
     });
     await page.locator('.rule-row').filter({hasText:`${pattern} →`}).locator('[data-delete-rule]').click();
     await page.waitForFunction(()=>document.querySelector('#toast').textContent.includes('规则已删除'));

@@ -30,7 +30,7 @@ TALLY_TEST_BINARY=target/x86_64-unknown-linux-musl/release/tally python3 scripts
 
 产物为 `target/x86_64-unknown-linux-musl/release/tally`。发布包只需包含该文件、`deploy/`、本部署说明和校验和；不要上传本地演示数据库或账户文件。在服务器解压后先运行 `sha256sum -c SHA256SUMS` 和 `./tally --help`，再安装。
 
-当前 0.2 musl 产物已在开发机完成 112 项真实 HTTP 检查（含 XLSX、退款和数据库备份），并确认是没有动态加载器或共享库依赖的 static PIE。尚未在目标服务器执行；上传后仍需完成启动和 HTTPS 验收。
+0.5.0 musl 产物在开发机验收包含 112 项基础 HTTP 检查（含 XLSX、退款和数据库备份）、101 项零元流水检查，以及混合用途分类浏览器流程，并确认是没有动态加载器或共享库依赖的 static PIE。尚未在目标服务器执行；上传后仍需完成启动和 HTTPS 验收。
 
 ## 2. 初始化目录和账户
 
@@ -122,16 +122,16 @@ sudo -u tally env TALLY_DB=/var/lib/tally/tally.sqlite3 \
 
 首次部署后应执行一次备份恢复演练，并确认金额、分摊计划和规则均完整。仓库中的 HTTP 冒烟测试已经验证在线备份的 SQLite 完整性与记录数量。
 
-## 6. 从 0.1 / 0.2 / 0.3 更新到 0.4.0（已有 Nginx/账户/账本）
+## 6. 从 0.1 / 0.2 / 0.3 / 0.4 更新到 0.5.0（已有 Nginx/账户/账本）
 
-0.4 保存分类规则时同步更新所有月份的匹配账单。删除规则后按剩余自定义规则重算，未命中则待分类。设置页提供“重新应用全部规则”，用于之前保存的规则。也包含 0.3.1 的完整分类选择与自定义分类输入修复。包含 0.3 的支付宝零元交易与共享单车按月汇总，以及 0.2 的微信 XLSX 日期修复与退款回冲。数据库结构仍为 v2；从 0.1 / 0.2 升级时自动迁移，保留账户、流水、分摊、退款关联和规则。无需运行 `init`，无需改 Nginx 或重新申请证书。
+0.5 增加跨月份的批量分类页面，支持按交易对象筛选、跨页勾选、固定单笔分类和商品关键词规则；设置中可以编辑已有规则。旧规则保持原有条件，旧账单分类不在启动时自动改变。旧记录默认未固定；批量分类默认固定，规则保存、删除和重新应用都保留固定记录。删除规则仍按剩余自定义规则重算未固定的匹配账单，未命中则待分类。数据库自动迁移到 v3，保留账户、流水、规则 ID、分摊和退款关联。无需运行 `init`，无需改 Nginx 或重新申请证书。
 
-将新包 `yibi-linux-x86_64-0.4.0.tar.gz` 上传到服务器 `/root/yibi/`。以下按当前 root 登录执行；先解包并核验：
+将新包 `yibi-linux-x86_64-0.5.0.tar.gz` 上传到服务器 `/root/yibi/`。以下按当前 root 登录执行；先解包并核验：
 
 ```sh
 cd /root/yibi
-tar -xzf yibi-linux-x86_64-0.4.0.tar.gz
-cd yibi-linux-x86_64-0.4.0
+tar -xzf yibi-linux-x86_64-0.5.0.tar.gz
+cd yibi-linux-x86_64-0.5.0
 sha256sum -c SHA256SUMS
 ./tally --help
 ```
@@ -145,7 +145,7 @@ sha256sum -c SHA256SUMS
   install -d -o tally -g tally -m 0700 /var/lib/tally/backups
   systemctl stop tally
   sudo -u tally env TALLY_DB=/var/lib/tally/tally.sqlite3 \
-    /opt/tally/tally backup "/var/lib/tally/backups/before-0.4-${YIBI_UPDATE_ID}.sqlite3"
+    /opt/tally/tally backup "/var/lib/tally/backups/before-0.5-${YIBI_UPDATE_ID}.sqlite3"
   cp -p /opt/tally/tally "/opt/tally/tally.before-${YIBI_UPDATE_ID}"
   install -m 0755 ./tally /opt/tally/tally
   systemctl start tally
@@ -155,9 +155,14 @@ sha256sum -c SHA256SUMS
 )
 ```
 
-若启动失败，执行 `journalctl -u tally -n 50 --no-pager` 查看原因。**0.1 / 0.2 程序不能打开 v2 数据库**；回退到这些版本时须停止服务，同时恢复本次保存的旧程序与 `before-0.4-…sqlite3` 备份。按上一节“备份与恢复”将当前主库及 `-wal`、`-shm` 移到保留目录后再恢复，避免混用。回退数据会撤销升级后的新增记录和修改。
+若启动失败，执行 `journalctl -u tally -n 50 --no-pager` 查看原因。**0.1–0.4 程序都不能打开 v3 数据库**；回退到旧版时须停止服务，同时恢复本次保存的旧程序与 `before-0.5-…sqlite3` 备份。按上一节“备份与恢复”将当前主库及 `-wal`、`-shm` 移到保留目录后再恢复，避免混用。回退数据会撤销升级后的新增记录和修改。
 
-更新后刷新浏览器，在设置页点“重新应用全部规则”，即可按已有规则同步历史分类。未来保存规则会自动同步；删除规则会按剩余自定义规则重算匹配账单，未命中归待分类。
+更新后刷新浏览器：
+
+- 从流水或设置进入“整理分类”，点击京东等交易对象，按实际用途分别勾选记录并批量保存。只有订单编号时不能自动判断外卖或购物。
+- “固定此笔分类”保护手工确认的例外；想重新跟随规则时，编辑单笔或批量取消固定，再在设置重新应用规则。
+- 原有分类规则和分类保留。新增或编辑规则时可同时限定商户和商品关键词；删除规则会重算旧匹配范围，固定记录保留。
+- 京东旧记录只有订单编号时，可手动补充商品说明。账单来源与交易号保持不变，重复导入不会新增原付款。
 
 可再导入支付宝原账单。如果旧版已导入 22 笔非零记录，新版会跳过它们并补入 118 笔零元记录；整份再次导入不会增加流水或骑行次数。每个月的零元共享单车合并显示，付费骑行和骑行卡费用独立显示。
 
